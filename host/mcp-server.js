@@ -796,6 +796,7 @@ server.tool(
       pid: process.pid,
       pidfilePath,
       uptimeSeconds: Math.floor((Date.now() - serverStartedAt) / 1000),
+      // Primary-mode fields: the local end of the one-and-only native host connection
       nativeHostSocketConnected: !!(nativeHostSocket && !nativeHostSocket.destroyed),
       nativeHostEverConnected,
       lastNativeHostConnectAt: lastNativeHostConnectAt ? new Date(lastNativeHostConnectAt).toISOString() : null,
@@ -805,8 +806,10 @@ server.tool(
       lastNativeHostMessageAt: lastNativeHostMessageAt ? new Date(lastNativeHostMessageAt).toISOString() : null,
       lastNativeHostMessageAgo: fmtAgo(lastNativeHostMessageAt),
       pendingRequestsCount: pendingRequests.size,
-      connectedClientsCount: clientSockets.size,
-      primarySocketAlive: !!(primarySocket && !primarySocket.destroyed),
+      // Primary-only: how many other mcp-server.js processes are connected to us as clients
+      ...(mode === "primary" ? { connectedClientsCount: clientSockets.size } : {}),
+      // Client-only: is our TCP link to the primary alive
+      ...(mode === "client" ? { primarySocketAlive: !!(primarySocket && !primarySocket.destroyed) } : {}),
     };
 
     let extension = null;
@@ -819,7 +822,18 @@ server.tool(
         sendToExtension("healthcheck", {}),
         new Promise((_, reject) => setTimeout(() => reject(new Error("extension probe timed out (5s) — service worker may be evicted")), 5000)),
       ]);
-      extension = probe;
+      // Unwrap the MCP content envelope: extension handlers return
+      // { content: [{ type: "text", text: "<json>" }] }. We want the parsed
+      // inner object, not the envelope.
+      if (probe && Array.isArray(probe.content) && probe.content[0]?.type === "text") {
+        try {
+          extension = JSON.parse(probe.content[0].text);
+        } catch {
+          extension = { raw: probe.content[0].text };
+        }
+      } else {
+        extension = probe;
+      }
       extensionReachable = true;
     } catch (err) {
       extensionError = err.message;
