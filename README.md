@@ -110,7 +110,7 @@ Reddit loads. No domain restriction.
 
 ## Available Tools
 
-All 18 tools, identical to Claude in Chrome:
+The 18 tools from Claude in Chrome, plus `healthcheck` (this fork):
 
 | Tool | Description |
 |------|-------------|
@@ -132,6 +132,7 @@ All 18 tools, identical to Claude in Chrome:
 | `shortcuts_execute` | Run shortcut (stub) |
 | `switch_browser` | Switch browser (stub) |
 | `update_plan` | Present plan (auto-approved) |
+| `healthcheck` | Diagnose the stack — mcp-server + native host + extension state, with concrete `advice` for next steps. **Call this BEFORE falling back to another browser tool.** |
 
 ## Named Tab Groups (multi-agent)
 
@@ -203,7 +204,29 @@ pkill -f "node.*mcp-server"
 
 ## Troubleshooting
 
-### Extension not connecting
+### First step: call `healthcheck`
+
+Before guessing, ask the stack to tell you what's wrong:
+
+```
+mcp__open-claude-in-chrome__healthcheck()
+```
+
+It returns the mcp-server's mode + bind address, the native-host connection state with timestamps, the extension's reported state (groups, attached tabs, version), and an `advice` field with concrete next steps. Use this to distinguish transient issues (worker reconnecting in a few seconds) from permanent ones (extension never installed). Agents should call this BEFORE deciding to fall back to a different browser tool.
+
+### Failure-mode taxonomy
+
+| Symptom | Most likely cause | Fix |
+|---|---|---|
+| `healthcheck` says `nativeHostEverConnected: false` | The extension has never connected to this MCP server. Either Chrome isn't running, the extension is disabled, or `install.sh` was never run for this extension ID. | Open Chrome, enable the extension at `chrome://extensions`, run `./install.sh <id>`, restart the browser. |
+| `healthcheck` says `nativeHostSocketConnected: false` but `nativeHostEverConnected: true` | The Chrome service worker was evicted. The keep-alive alarm reconnects every ~24 s. | Open any tab in the browser to wake the worker, retry in a few seconds. |
+| `healthcheck` says `extensionReachable: false` but `nativeHostSocketConnected: true` | Service worker is hung or crashed mid-handler. | Reload the extension at `chrome://extensions`. |
+| `healthcheck` succeeds but tool calls still time out | Tool dispatch hung inside the extension. | Reload the extension. If repeats, file an issue. |
+| MCP server reports disconnected immediately at session start | A stale `mcp-server.js` from an earlier session is holding the TCP port and the extension is connected to it instead. | `pkill -f "node.*mcp-server"`, then `/mcp` to reconnect. |
+| Tools work but new groups end up in their own browser windows instead of sharing one | Pre-multi-group fork, or the global creation mutex isn't in place. | Update to the latest fork (post-`feat: named tab groups for multi-agent isolation`). |
+| `healthcheck` shows the wrong `port` | Custom config under `~/.config/open-claude-in-chrome/config.json` is overriding the default. | Either accept it or remove the config and restart browser + MCP server. |
+
+### Extension not connecting (manual checks)
 
 1. Verify the extension is loaded and enabled
 2. Check that `./install.sh` was run with the correct extension ID

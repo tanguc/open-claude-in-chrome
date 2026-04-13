@@ -41,6 +41,19 @@ let nativeHostSocket = null;
 const pendingRequests = new Map(); // id -> { resolve, reject, timer, tool, args, resent }
 let requestIdCounter = 0;
 
+// Connection state tracking for diagnostics + smarter error messages.
+// nativeHostEverConnected: has a native host EVER connected to this primary
+//   since startup? Distinguishes "extension never installed" from "extension
+//   was here and is currently dropped".
+// lastNativeHostConnectAt: timestamp of the most recent successful connection
+// lastNativeHostDisconnectAt: timestamp of the most recent disconnection
+// lastNativeHostMessageAt: timestamp of the most recent inbound message
+const serverStartedAt = Date.now();
+let nativeHostEverConnected = false;
+let lastNativeHostConnectAt = null;
+let lastNativeHostDisconnectAt = null;
+let lastNativeHostMessageAt = null;
+
 // Primary mode: track client MCP server connections
 const clientSockets = new Map(); // clientId -> socket
 let clientIdCounter = 0;
@@ -51,6 +64,53 @@ const clientRequestMap = new Map();
 let primarySocket = null;
 let clientBuffer = Buffer.alloc(0);
 
+// --- Diagnostic helpers ---
+
+function fmtAgo(ts) {
+  if (!ts) return "never";
+  const ms = Date.now() - ts;
+  if (ms < 1000) return `${ms}ms ago`;
+  if (ms < 60000) return `${Math.floor(ms / 1000)}s ago`;
+  if (ms < 3600000) return `${Math.floor(ms / 60000)}m ago`;
+  return `${Math.floor(ms / 3600000)}h ago`;
+}
+
+function describeExtensionUnavailable() {
+  if (mode === "client") {
+    return "Lost connection to the primary MCP server (multi-session multiplexing). The primary may have been killed. Restart with: `pkill -f \"node.*open-claude-in-chrome.*mcp-server\"` then reconnect /mcp.";
+  }
+  if (!nativeHostEverConnected) {
+    return [
+      "Browser extension has NEVER connected to this MCP server since it started",
+      `${fmtAgo(serverStartedAt)}.`,
+      "",
+      "Likely causes:",
+      "  1. Chrome / Brave / Edge is not currently running. Open it.",
+      "  2. The Open Claude in Chrome extension is not loaded or is disabled.",
+      "     Check chrome://extensions and ensure it's enabled.",
+      "  3. install.sh was never run for this browser, or the extension ID",
+      "     in the native messaging manifest doesn't match the loaded extension.",
+      "     Re-run: ./install.sh <extension-id> from the project root,",
+      "     then restart the browser.",
+      "  4. The browser was just opened — the service worker may not have",
+      "     started yet. Open any tab to wake it, then retry.",
+      "",
+      "Call mcp__open-claude-in-chrome__healthcheck for full diagnostics.",
+    ].join("\n");
+  }
+  return [
+    `Browser extension was connected but the native messaging host is currently disconnected (last seen ${fmtAgo(lastNativeHostDisconnectAt)}, last message ${fmtAgo(lastNativeHostMessageAt)}).`,
+    "",
+    "Likely causes:",
+    "  1. Chrome service worker was evicted. Open any tab in the browser",
+    "     to wake it back up — the keep-alive alarm will reconnect it.",
+    "  2. Browser was closed. Reopen it and the extension will reconnect.",
+    "  3. Service worker crashed. Reload the extension at chrome://extensions.",
+    "",
+    "Call mcp__open-claude-in-chrome__healthcheck for full diagnostics.",
+  ].join("\n");
+}
+
 // --- sendToExtension: works in both modes ---
 
 function sendToExtension(tool, args) {
@@ -58,7 +118,12 @@ function sendToExtension(tool, args) {
     const id = String(++requestIdCounter);
     const timer = setTimeout(() => {
       pendingRequests.delete(id);
-      reject(new Error("Tool request timed out after 60s"));
+      reject(new Error(
+        `Tool request "${tool}" timed out after 60s.\n\n` +
+        "The native host accepted the request but the extension never replied.\n" +
+        "The service worker may be hung; try reloading the extension at chrome://extensions.\n" +
+        "Call mcp__open-claude-in-chrome__healthcheck for full diagnostics."
+      ));
     }, 60000);
     pendingRequests.set(id, { resolve, reject, timer, tool, args, resent: false });
 
@@ -66,7 +131,7 @@ function sendToExtension(tool, args) {
       if (!nativeHostSocket || nativeHostSocket.destroyed) {
         clearTimeout(timer);
         pendingRequests.delete(id);
-        reject(new Error("Browser extension is not connected. Make sure a supported Chromium browser is running with the Open Claude in Chrome extension installed and enabled."));
+        reject(new Error(describeExtensionUnavailable()));
         return;
       }
       const msg = JSON.stringify({ id, type: "tool_request", tool, args }) + "\n";
@@ -76,7 +141,7 @@ function sendToExtension(tool, args) {
       if (!primarySocket || primarySocket.destroyed) {
         clearTimeout(timer);
         pendingRequests.delete(id);
-        reject(new Error("Lost connection to primary MCP server."));
+        reject(new Error(describeExtensionUnavailable()));
         return;
       }
       const msg = JSON.stringify({ id, type: "tool_request", tool, args }) + "\n";
@@ -208,6 +273,9 @@ function setupNativeHostConnection(socket, initialBuffer) {
   }
 
   nativeHostSocket = socket;
+  nativeHostEverConnected = true;
+  lastNativeHostConnectAt = Date.now();
+  lastNativeHostMessageAt = Date.now();
   let buffer = initialBuffer;
 
   // Process any data already in the buffer
@@ -218,6 +286,7 @@ function setupNativeHostConnection(socket, initialBuffer) {
   }
 
   socket.on("data", (chunk) => {
+    lastNativeHostMessageAt = Date.now();
     buffer = Buffer.concat([buffer, chunk]);
     let newlineIdx;
     while ((newlineIdx = buffer.indexOf(10)) !== -1) {
@@ -226,10 +295,18 @@ function setupNativeHostConnection(socket, initialBuffer) {
     }
   });
 
-  socket.on("error", () => { nativeHostSocket = null; });
+  socket.on("error", () => {
+    if (nativeHostSocket === socket) {
+      nativeHostSocket = null;
+      lastNativeHostDisconnectAt = Date.now();
+    }
+  });
 
   socket.on("close", () => {
-    if (nativeHostSocket === socket) nativeHostSocket = null;
+    if (nativeHostSocket === socket) {
+      nativeHostSocket = null;
+      lastNativeHostDisconnectAt = Date.now();
+    }
     if (pendingRequests.size > 0) {
       setTimeout(() => {
         if (nativeHostSocket && !nativeHostSocket.destroyed) {
@@ -698,6 +775,86 @@ server.tool(
     filename: z.string().optional().describe('Optional filename for the uploaded file (default: "image.png")'),
   },
   async (args) => callTool("upload_image", args)
+);
+
+// 19. healthcheck
+//
+// Composes mcp-server's local state + a best-effort probe of the extension.
+// Always returns local state even if the extension is unreachable, plus an
+// `advice` string with concrete next steps. Agents should call this BEFORE
+// falling back to another browser MCP — it distinguishes transient issues
+// (extension reconnecting) from permanent ones (extension not installed).
+server.tool(
+  "healthcheck",
+  "Diagnose the open-claude-in-chrome stack. Returns: mcp-server mode + bind address, native-host connection status with timestamps, pending-request count, connected-client count, plus a best-effort probe of the extension itself (groups, attached tabs, version). Always returns local state even if the extension is unreachable. Includes an `advice` string with concrete next steps. Call this BEFORE falling back to another browser tool — it distinguishes transient issues (worker reconnecting, retry in a few seconds) from permanent ones (extension not installed, run install.sh).",
+  {},
+  async () => {
+    const local = {
+      mode,
+      bindAddress: "127.0.0.1",
+      port: TCP_PORT,
+      pid: process.pid,
+      pidfilePath,
+      uptimeSeconds: Math.floor((Date.now() - serverStartedAt) / 1000),
+      nativeHostSocketConnected: !!(nativeHostSocket && !nativeHostSocket.destroyed),
+      nativeHostEverConnected,
+      lastNativeHostConnectAt: lastNativeHostConnectAt ? new Date(lastNativeHostConnectAt).toISOString() : null,
+      lastNativeHostConnectAgo: fmtAgo(lastNativeHostConnectAt),
+      lastNativeHostDisconnectAt: lastNativeHostDisconnectAt ? new Date(lastNativeHostDisconnectAt).toISOString() : null,
+      lastNativeHostDisconnectAgo: fmtAgo(lastNativeHostDisconnectAt),
+      lastNativeHostMessageAt: lastNativeHostMessageAt ? new Date(lastNativeHostMessageAt).toISOString() : null,
+      lastNativeHostMessageAgo: fmtAgo(lastNativeHostMessageAt),
+      pendingRequestsCount: pendingRequests.size,
+      connectedClientsCount: clientSockets.size,
+      primarySocketAlive: !!(primarySocket && !primarySocket.destroyed),
+    };
+
+    let extension = null;
+    let extensionReachable = false;
+    let extensionError = null;
+
+    try {
+      // Short timeout (5s) so a hung extension doesn't make healthcheck slow
+      const probe = await Promise.race([
+        sendToExtension("healthcheck", {}),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("extension probe timed out (5s) — service worker may be evicted")), 5000)),
+      ]);
+      extension = probe;
+      extensionReachable = true;
+    } catch (err) {
+      extensionError = err.message;
+    }
+
+    let advice;
+    if (extensionReachable) {
+      advice = "All systems healthy. open-claude-in-chrome is fully operational.";
+    } else if (mode === "client") {
+      advice = "Running as a client of another mcp-server.js (multi-session). " +
+        "If unhealthy, the primary may be in trouble. Check the primary's pidfile.";
+    } else if (!nativeHostEverConnected) {
+      advice = "PERMANENT: extension has never connected to this MCP server. " +
+        "Open Chrome / Brave / Edge, ensure the Open Claude in Chrome extension is enabled at chrome://extensions, " +
+        "and verify install.sh has been run for that extension's ID. " +
+        "Do NOT silently fall back — tell the user the extension is missing and ask them to fix it.";
+    } else if (!local.nativeHostSocketConnected) {
+      advice = "TRANSIENT: extension was connected but the native messaging host is currently dropped " +
+        `(disconnected ${local.lastNativeHostDisconnectAgo}). ` +
+        "Likely the Chrome service worker was evicted. Open any browser tab to wake it, " +
+        "then retry in a few seconds. The keep-alive alarm reconnects every ~24s automatically.";
+    } else {
+      advice = "Native host is connected but the extension didn't respond to the probe. " +
+        "Service worker may be hung — reload the extension at chrome://extensions. " +
+        `Probe error: ${extensionError}`;
+    }
+
+    return textResult(JSON.stringify({
+      mcpServer: local,
+      extensionReachable,
+      extension,
+      extensionError,
+      advice,
+    }, null, 2));
+  }
 );
 
 // --- Start MCP server ---

@@ -1117,6 +1117,39 @@ const toolHandlers = {
     text += "\nPlan auto-approved (no permission restrictions in this extension).";
     return { content: [{ type: "text", text }] };
   },
+
+  async healthcheck() {
+    // Reports extension-side state. The mcp-server's healthcheck tool composes
+    // this with its own local state (TCP bind, native-host connection, etc.)
+    // and returns the merged result to the caller.
+    let manifest = {};
+    try { manifest = chrome.runtime.getManifest(); } catch {}
+
+    const groups = {};
+    for (const [name, meta] of groupsByName) {
+      groups[name] = {
+        tabGroupId: meta.id,
+        color: meta.color,
+        tabCount: meta.tabIds.size,
+      };
+    }
+
+    const data = {
+      extensionName: manifest.name || "unknown",
+      extensionVersion: manifest.version || "unknown",
+      manifestVersion: manifest.manifest_version || null,
+      nativePortConnected: nativePort !== null,
+      groupsCount: groupsByName.size,
+      groups,
+      attachedTabsCount: attachedTabs.size,
+      consoleBuffersCount: consoleMessages.size,
+      networkBuffersCount: networkRequests.size,
+      screenshotStoreSize: screenshotStore.size,
+      timestamp: new Date().toISOString(),
+    };
+
+    return { content: [{ type: "text", text: JSON.stringify(data) }] };
+  },
 };
 
 // --- Tool dispatch ---
