@@ -8,10 +8,76 @@ self.addEventListener("unhandledrejection", (event) => {
 
 const NATIVE_HOST_NAME = "com.anthropic.open_claude_in_chrome";
 
+// --- Multi-group state ---
+// Each agent owns a named tab group. groupName is the identity and the per-tab
+// metadata: any tab inside a named group "belongs to" the agent that named it.
+const DEFAULT_GROUP_COLOR = "blue";
+const VALID_GROUP_COLORS = ["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"];
+
+// groupName -> { id: <chrome tabGroupId>, color: string, tabIds: Set<number> }
+const groupsByName = new Map();
+// Per-name de-dup: callers asking for the same name share one in-flight promise
+const groupCreationLocks = new Map();
+// Global creation mutex: serializes all NEW group creations so two concurrent
+// bootstraps from an empty state can't both spawn a host window. Once any group
+// exists, subsequent creates inside the locked section see the host window and
+// reuse it.
+let creationMutex = Promise.resolve();
+// Init promise, awaited in handleToolRequest before processing any tool
+let stateLoaded = null;
+
+async function persistGroupsState() {
+  try {
+    const out = {};
+    for (const [name, meta] of groupsByName) {
+      out[name] = { id: meta.id, color: meta.color };
+    }
+    await chrome.storage.local.set({ groups: out });
+  } catch {}
+}
+
+async function loadGroupsState() {
+  try {
+    const stored = await chrome.storage.local.get(["groups"]);
+    const persisted = stored.groups || {};
+    for (const [name, meta] of Object.entries(persisted)) {
+      try {
+        const group = await chrome.tabGroups.get(meta.id);
+        if (group && group.title === name) {
+          const tabs = await chrome.tabs.query({ groupId: group.id });
+          groupsByName.set(name, {
+            id: group.id,
+            color: VALID_GROUP_COLORS.includes(meta.color) ? meta.color : DEFAULT_GROUP_COLOR,
+            tabIds: new Set(tabs.map((t) => t.id)),
+          });
+        }
+      } catch {
+        // Group is gone since last persist; drop it silently
+      }
+    }
+    // Persist back any cleanup
+    await persistGroupsState();
+  } catch {}
+}
+
+function validateGroupName(name) {
+  if (typeof name !== "string") throw new Error("groupName must be a string");
+  const trimmed = name.trim();
+  if (!trimmed) throw new Error("groupName must be non-empty");
+  if (trimmed.length > 50) throw new Error("groupName must be 50 characters or fewer");
+  return trimmed;
+}
+
+function validateColor(color) {
+  if (color === undefined || color === null || color === "") return null;
+  if (typeof color !== "string" || !VALID_GROUP_COLORS.includes(color)) {
+    throw new Error(`color must be one of: ${VALID_GROUP_COLORS.join(", ")}`);
+  }
+  return color;
+}
+
 // --- State ---
 let nativePort = null;
-let tabGroupId = null;
-let tabGroupTabs = new Set();
 const attachedTabs = new Map(); // tabId -> { enabledDomains: Set }
 const consoleMessages = new Map(); // tabId -> [{level, text, timestamp, url}]
 const networkRequests = new Map(); // tabId -> [{url, method, status, type, timestamp}]
@@ -67,79 +133,184 @@ function sendError(id, error) {
   }
 }
 
-// --- Tab group management ---
-async function ensureTabGroup(createIfEmpty) {
-  // Check if our tab group still exists
-  if (tabGroupId !== null) {
-    try {
-      const group = await chrome.tabGroups.get(tabGroupId);
-      if (group) {
-        // Verify tabs are still in the group
-        const tabs = await chrome.tabs.query({ groupId: tabGroupId });
-        tabGroupTabs = new Set(tabs.map((t) => t.id));
-        if (tabGroupTabs.size > 0) return;
-      }
-    } catch {
-      tabGroupId = null;
-      tabGroupTabs.clear();
-    }
+// --- Multi-group management ---
+
+// Verify a tracked group still exists in chrome. If not, drop from state.
+async function refreshGroupMeta(name) {
+  const meta = groupsByName.get(name);
+  if (!meta) return null;
+  try {
+    await chrome.tabGroups.get(meta.id);
+    const tabs = await chrome.tabs.query({ groupId: meta.id });
+    meta.tabIds = new Set(tabs.map((t) => t.id));
+    return meta;
+  } catch {
+    groupsByName.delete(name);
+    await persistGroupsState();
+    return null;
   }
-
-  if (!createIfEmpty) return;
-
-  // Create a new window with a tab, group it
-  const win = await chrome.windows.create({ focused: true, url: "about:blank" });
-  const tab = win.tabs[0];
-  const groupId = await chrome.tabs.group({ tabIds: [tab.id] });
-  await chrome.tabGroups.update(groupId, { title: "MCP", color: "blue" });
-  tabGroupId = groupId;
-  tabGroupTabs = new Set([tab.id]);
 }
 
-function formatTabContext(tabs) {
-  const available = tabs.map((t) => ({
+// Idempotent: returns existing group meta if present, otherwise creates a new
+// window+tab+group with the given name and color. Race-safe via per-name lock.
+async function ensureNamedGroup(name, color) {
+  const trimmed = validateGroupName(name);
+  const validatedColor = validateColor(color);
+
+  const existing = await refreshGroupMeta(trimmed);
+  if (existing) {
+    if (validatedColor && validatedColor !== existing.color) {
+      try {
+        await chrome.tabGroups.update(existing.id, { color: validatedColor });
+        existing.color = validatedColor;
+        await persistGroupsState();
+      } catch {}
+    }
+    return existing;
+  }
+
+  if (groupCreationLocks.has(trimmed)) return groupCreationLocks.get(trimmed);
+
+  const promise = (async () => {
+    // Acquire the global creation mutex so concurrent first-time bootstraps
+    // can't both spawn a host window. Pattern: chain a new promise onto the
+    // mutex, await the previous tail, run, then release.
+    const previousTail = creationMutex;
+    let release;
+    creationMutex = new Promise((r) => { release = r; });
+    await previousTail;
+
+    try {
+      // Re-check after acquiring: while we waited, another caller may have
+      // created our exact name OR established a host window we should reuse.
+      const recheck = await refreshGroupMeta(trimmed);
+      if (recheck) return recheck;
+
+      const finalColor = validatedColor || DEFAULT_GROUP_COLOR;
+
+      // Reuse an existing window that already hosts one of our groups so all
+      // named groups live side-by-side in one tab strip. Only spawn a fresh
+      // window if no host window exists yet.
+      let hostWindowId = null;
+      for (const meta of groupsByName.values()) {
+        try {
+          const g = await chrome.tabGroups.get(meta.id);
+          hostWindowId = g.windowId;
+          break;
+        } catch {}
+      }
+
+      let tab;
+      if (hostWindowId !== null) {
+        tab = await chrome.tabs.create({ active: true, windowId: hostWindowId, url: "about:blank" });
+      } else {
+        const win = await chrome.windows.create({ focused: true, url: "about:blank" });
+        tab = win.tabs[0];
+      }
+
+      const groupId = await chrome.tabs.group({ tabIds: [tab.id] });
+      await chrome.tabGroups.update(groupId, { title: trimmed, color: finalColor });
+      const meta = { id: groupId, color: finalColor, tabIds: new Set([tab.id]) };
+      groupsByName.set(trimmed, meta);
+      await persistGroupsState();
+      return meta;
+    } finally {
+      release();
+    }
+  })();
+
+  groupCreationLocks.set(trimmed, promise);
+  try {
+    return await promise;
+  } finally {
+    groupCreationLocks.delete(trimmed);
+  }
+}
+
+// Find which (if any) of our named groups owns a given tabId.
+async function findGroupForTab(tabId) {
+  // Quick path: scan in-memory state
+  for (const [name, meta] of groupsByName) {
+    if (meta.tabIds.has(tabId)) return { name, meta };
+  }
+  // Slow path: maybe service worker lost in-memory tabIds. Resolve via chrome.
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.groupId === -1) return null;
+    for (const [name, meta] of groupsByName) {
+      if (meta.id === tab.groupId) {
+        meta.tabIds.add(tabId);
+        return { name, meta };
+      }
+    }
+    // Maybe a brand new group whose title matches one we persisted but didn't reload yet
+    const group = await chrome.tabGroups.get(tab.groupId);
+    if (group && groupsByName.has(group.title)) {
+      const meta = groupsByName.get(group.title);
+      meta.id = group.id;
+      meta.tabIds.add(tabId);
+      return { name: group.title, meta };
+    }
+  } catch {}
+  return null;
+}
+
+async function isInOurGroup(tabId) {
+  return (await findGroupForTab(tabId)) !== null;
+}
+
+function tabSummary(tabs) {
+  return tabs.map((t) => ({
     tabId: t.id,
     title: t.title || "Untitled",
     url: t.url || "",
   }));
+}
 
-  let text = `Tab Context:\n- Available tabs:\n`;
+function formatSingleGroupContext(name, meta, tabs) {
+  const available = tabSummary(tabs);
+  let text = `Tab Context (group "${name}"):\n- Available tabs:\n`;
   for (const t of available) {
     text += `  \u2022 tabId ${t.tabId}: "${t.title}" (${t.url})\n`;
   }
-
   return {
     content: [
       {
         type: "text",
-        text: JSON.stringify({ availableTabs: available, tabGroupId }) + "\n\n" + text,
+        text:
+          JSON.stringify({
+            groupName: name,
+            tabGroupId: meta.id,
+            color: meta.color,
+            availableTabs: available,
+          }) +
+          "\n\n" +
+          text,
       },
     ],
   };
 }
 
-async function isInGroup(tabId) {
-  // Always check live state — in-memory tabGroupTabs can be stale after service worker restart
-  try {
-    const tab = await chrome.tabs.get(tabId);
-    if (tab.groupId !== -1) {
-      // Recover tabGroupId if we lost it (service worker restart)
-      if (tabGroupId === null) {
-        try {
-          const group = await chrome.tabGroups.get(tab.groupId);
-          if (group.title === "MCP") {
-            tabGroupId = group.id;
-            const groupTabs = await chrome.tabs.query({ groupId: tabGroupId });
-            tabGroupTabs = new Set(groupTabs.map((t) => t.id));
-          }
-        } catch {}
-      }
-      return tab.groupId === tabGroupId;
-    }
-    return tabGroupTabs.has(tabId);
-  } catch {
-    return false;
+async function formatAllGroupsContext() {
+  const groups = {};
+  let text = `Tab Context (all MCP-managed groups):\n`;
+  if (groupsByName.size === 0) {
+    text += `- No groups exist yet. Call tabs_context_mcp({ groupName: "<your-name>", createIfEmpty: true }) to create one.\n`;
   }
+  for (const [name, meta] of groupsByName) {
+    const tabs = await chrome.tabs.query({ groupId: meta.id });
+    const available = tabSummary(tabs);
+    groups[name] = { tabGroupId: meta.id, color: meta.color, tabs: available };
+    text += `\n[${name}] color=${meta.color} tabGroupId=${meta.id}\n`;
+    for (const t of available) {
+      text += `  \u2022 tabId ${t.tabId}: "${t.title}" (${t.url})\n`;
+    }
+  }
+  return {
+    content: [
+      { type: "text", text: JSON.stringify({ groups }) + "\n\n" + text },
+    ],
+  };
 }
 
 // --- CDP helpers ---
@@ -173,8 +344,19 @@ async function cdp(tabId, method, params = {}) {
 }
 
 // Clean up when tab is closed
-chrome.tabs.onRemoved.addListener((tabId) => {
-  tabGroupTabs.delete(tabId);
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  let mutated = false;
+  for (const [name, meta] of groupsByName) {
+    if (meta.tabIds.delete(tabId)) {
+      mutated = true;
+      if (meta.tabIds.size === 0) {
+        // Chrome auto-removes the group when its last tab closes; drop our state too
+        groupsByName.delete(name);
+      }
+      break;
+    }
+  }
+  if (mutated) await persistGroupsState();
   if (attachedTabs.has(tabId)) {
     try { chrome.debugger.detach({ tabId }); } catch {}
     attachedTabs.delete(tabId);
@@ -381,30 +563,63 @@ function sleep(ms) {
 // --- Tool handlers ---
 const toolHandlers = {
   async tabs_context_mcp(args) {
-    await ensureTabGroup(args.createIfEmpty);
-    if (tabGroupId === null) {
+    const { groupName, createIfEmpty, color } = args || {};
+
+    // No groupName: return ALL groups owned by this extension instance.
+    if (groupName === undefined || groupName === null || groupName === "") {
+      return formatAllGroupsContext();
+    }
+
+    const trimmed = validateGroupName(groupName);
+
+    // Group exists already
+    const existing = await refreshGroupMeta(trimmed);
+    if (existing) {
+      const tabs = await chrome.tabs.query({ groupId: existing.id });
+      return formatSingleGroupContext(trimmed, existing, tabs);
+    }
+
+    // Doesn't exist
+    if (!createIfEmpty) {
       return {
-        content: [{ type: "text", text: "No MCP tab group exists. Use createIfEmpty: true to create one." }],
+        content: [
+          {
+            type: "text",
+            text: `No MCP tab group named "${trimmed}" exists. Pass createIfEmpty: true to create it.`,
+          },
+        ],
       };
     }
-    const tabs = await chrome.tabs.query({ groupId: tabGroupId });
-    return formatTabContext(tabs);
+
+    const meta = await ensureNamedGroup(trimmed, color);
+    const tabs = await chrome.tabs.query({ groupId: meta.id });
+    return formatSingleGroupContext(trimmed, meta, tabs);
   },
 
   async tabs_create_mcp(args) {
-    await ensureTabGroup(true);
-    const tab = await chrome.tabs.create({ active: true });
-    await chrome.tabs.group({ tabIds: [tab.id], groupId: tabGroupId });
-    tabGroupTabs.add(tab.id);
-    const tabs = await chrome.tabs.query({ groupId: tabGroupId });
-    const result = formatTabContext(tabs);
-    result.content[0].text = `Created new tab. Tab ID: ${tab.id}\n\n` + result.content[0].text;
+    const { groupName, color } = args || {};
+    if (groupName === undefined || groupName === null || groupName === "") {
+      throw new Error('groupName is required. Call tabs_context_mcp({ groupName, createIfEmpty: true }) first to establish your group.');
+    }
+    const trimmed = validateGroupName(groupName);
+
+    // ensureNamedGroup is idempotent — creates the group if missing, returns existing meta otherwise.
+    const meta = await ensureNamedGroup(trimmed, color);
+
+    const tab = await chrome.tabs.create({ active: true, windowId: (await chrome.tabGroups.get(meta.id)).windowId });
+    await chrome.tabs.group({ tabIds: [tab.id], groupId: meta.id });
+    meta.tabIds.add(tab.id);
+    await persistGroupsState();
+
+    const tabs = await chrome.tabs.query({ groupId: meta.id });
+    const result = formatSingleGroupContext(trimmed, meta, tabs);
+    result.content[0].text = `Created new tab in group "${trimmed}". Tab ID: ${tab.id}\n\n` + result.content[0].text;
     return result;
   },
 
   async navigate(args) {
     const { url, tabId } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    if (!(await isInOurGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in any MCP-managed tab group.` }] };
 
     if (url === "back") {
       await chrome.tabs.goBack(tabId);
@@ -444,7 +659,9 @@ const toolHandlers = {
     });
 
     const tab = await chrome.tabs.get(tabId);
-    const tabs = await chrome.tabs.query({ groupId: tabGroupId });
+    const tabs = tab.groupId !== -1
+      ? await chrome.tabs.query({ groupId: tab.groupId })
+      : [tab];
     const loading = tab.status !== "complete" ? " (still loading)" : "";
     const text = `Navigated to ${tab.url}${loading}.\n## Pages\n` +
       tabs.map((t, i) => `${i + 1}: ${t.url}${t.id === tabId ? " [selected]" : ""}`).join("\n");
@@ -454,7 +671,7 @@ const toolHandlers = {
 
   async computer(args) {
     const { action, tabId } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    if (!(await isInOurGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in any MCP-managed tab group.` }] };
 
     let coordinate = args.coordinate;
     // Resolve ref to coordinates if provided
@@ -648,7 +865,7 @@ const toolHandlers = {
 
   async read_page(args) {
     const { tabId } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    if (!(await isInOurGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in any MCP-managed tab group.` }] };
 
     const resp = await sendContentMessage(tabId, {
       type: "generateAccessibilityTree",
@@ -674,7 +891,7 @@ const toolHandlers = {
 
   async get_page_text(args) {
     const { tabId } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    if (!(await isInOurGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in any MCP-managed tab group.` }] };
 
     const resp = await sendContentMessage(tabId, { type: "getPageText" });
     if (!resp?.result) return { content: [{ type: "text", text: "Error: Could not extract page text" }] };
@@ -696,7 +913,7 @@ const toolHandlers = {
 
   async find(args) {
     const { query, tabId } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    if (!(await isInOurGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in any MCP-managed tab group.` }] };
 
     const resp = await sendContentMessage(tabId, { type: "findElements", query });
     const results = resp?.result || [];
@@ -715,7 +932,7 @@ const toolHandlers = {
 
   async form_input(args) {
     const { ref, value, tabId } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    if (!(await isInOurGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in any MCP-managed tab group.` }] };
 
     const resp = await sendContentMessage(tabId, { type: "setFormValue", ref, value });
     const result = resp?.result;
@@ -726,7 +943,7 @@ const toolHandlers = {
 
   async javascript_tool(args) {
     const { text, tabId } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    if (!(await isInOurGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in any MCP-managed tab group.` }] };
 
     await ensureAttached(tabId);
     try {
@@ -754,7 +971,7 @@ const toolHandlers = {
 
   async read_console_messages(args) {
     const { tabId, pattern, limit = 100, onlyErrors, clear } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    if (!(await isInOurGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in any MCP-managed tab group.` }] };
 
     // Ensure console domain is enabled
     await ensureAttached(tabId);
@@ -796,7 +1013,7 @@ const toolHandlers = {
 
   async read_network_requests(args) {
     const { tabId, urlPattern, limit = 100, clear } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    if (!(await isInOurGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in any MCP-managed tab group.` }] };
 
     // Ensure network domain is enabled
     await ensureAttached(tabId);
@@ -827,7 +1044,7 @@ const toolHandlers = {
 
   async resize_window(args) {
     const { width, height, tabId } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    if (!(await isInOurGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in any MCP-managed tab group.` }] };
 
     const tab = await chrome.tabs.get(tabId);
     await chrome.windows.update(tab.windowId, { width, height });
@@ -836,7 +1053,7 @@ const toolHandlers = {
 
   async upload_image(args) {
     const { imageId, tabId, ref, coordinate, filename = "image.png" } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    if (!(await isInOurGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in any MCP-managed tab group.` }] };
 
     const base64 = screenshotStore.get(imageId);
     if (!base64) {
@@ -904,6 +1121,10 @@ const toolHandlers = {
 
 // --- Tool dispatch ---
 async function handleToolRequest(id, tool, args) {
+  // Block until persisted multi-group state is loaded so handlers see the right Map.
+  if (stateLoaded) {
+    try { await stateLoaded; } catch {}
+  }
   const handler = toolHandlers[tool];
   if (!handler) {
     sendError(id, `Unknown tool: ${tool}`);
@@ -920,19 +1141,5 @@ async function handleToolRequest(id, tool, args) {
 
 // --- Init ---
 
-// Recover MCP tab group state after service worker restart
-async function recoverTabGroupState() {
-  try {
-    const groups = await chrome.tabGroups.query({ title: "MCP" });
-    if (groups.length > 0) {
-      tabGroupId = groups[0].id;
-      const tabs = await chrome.tabs.query({ groupId: tabGroupId });
-      tabGroupTabs = new Set(tabs.map((t) => t.id));
-    }
-  } catch {
-    // Not critical — will be set on first tabs_context_mcp call
-  }
-}
-
-recoverTabGroupState();
-connectNativeHost();
+stateLoaded = loadGroupsState();
+stateLoaded.then(connectNativeHost);

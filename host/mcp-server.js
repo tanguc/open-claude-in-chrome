@@ -470,16 +470,23 @@ const server = new McpServer({
 // 1. tabs_context_mcp
 server.tool(
   "tabs_context_mcp",
-  "Get context information about the current MCP tab group. Returns all tab IDs inside the group if it exists. CRITICAL: You must get the context at least once before using other browser automation tools so you know what tabs exist. Each new conversation should create its own new tab (using tabs_create_mcp) rather than reusing existing tabs, unless the user explicitly asks to use an existing tab.",
-  { createIfEmpty: z.boolean().optional().describe("Creates a new MCP tab group if none exists, creates a new Window with a new tab group containing an empty tab (which can be used for this conversation). If a MCP tab group already exists, this parameter has no effect.") },
+  "Establish or inspect a NAMED tab group owned by your agent. CRITICAL: Call this at the start of every session with a unique, project-meaningful groupName (e.g. 'agent-foo', 'sergen-claude', 'research-bot') and createIfEmpty: true to bootstrap your isolated working group. Multiple agents/repos can share the same browser by each picking a distinct groupName — the group name is the per-tab metadata that distinguishes which agent owns which tab in the Chrome tab strip. Without a groupName argument, this returns ALL groups currently managed by this extension (useful for orchestrators that need to see the full topology).",
+  {
+    groupName: z.string().optional().describe("The unique name for your agent's tab group. Required when establishing a new group; omit to list all existing groups. Max 50 characters."),
+    createIfEmpty: z.boolean().optional().describe("If true and the named group does not yet exist, create it (opens a new browser window with one empty tab labelled with groupName). Ignored when groupName is omitted."),
+    color: z.enum(["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"]).optional().describe("Optional color for the group when creating it. Defaults to blue. Picking a distinct color per agent makes them easy to tell apart visually in the tab strip."),
+  },
   async (args) => callTool("tabs_context_mcp", args)
 );
 
 // 2. tabs_create_mcp
 server.tool(
   "tabs_create_mcp",
-  "Creates a new empty tab in the MCP tab group. CRITICAL: You must get the context using tabs_context_mcp at least once before using other browser automation tools so you know what tabs exist.",
-  {},
+  "Create a new empty tab inside your NAMED tab group. groupName is REQUIRED — pass the same name you used in tabs_context_mcp to bootstrap the group. The new tab is added to that named group only; tabs in other agents' groups are not touched. If the named group does not yet exist this call will create it (idempotent), but the canonical entry point for establishing a group is tabs_context_mcp({ groupName, createIfEmpty: true }).",
+  {
+    groupName: z.string().describe("The name of YOUR agent's tab group. Required. Must match the groupName you established with tabs_context_mcp."),
+    color: z.enum(["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"]).optional().describe("Optional color, only honored if this call ends up creating the group. Defaults to blue."),
+  },
   async (args) => callTool("tabs_create_mcp", args)
 );
 
