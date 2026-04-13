@@ -114,8 +114,8 @@ All 18 tools, identical to Claude in Chrome:
 
 | Tool | Description |
 |------|-------------|
-| `tabs_context_mcp` | Get tab group context |
-| `tabs_create_mcp` | Create new tab |
+| `tabs_context_mcp` | Establish or inspect a NAMED tab group (entry point for every session) |
+| `tabs_create_mcp` | Add a new tab to your named group |
 | `navigate` | Navigate to URL, back, forward |
 | `computer` | Mouse, keyboard, screenshots (13 actions) |
 | `read_page` | Accessibility tree with element refs |
@@ -132,6 +132,33 @@ All 18 tools, identical to Claude in Chrome:
 | `shortcuts_execute` | Run shortcut (stub) |
 | `switch_browser` | Switch browser (stub) |
 | `update_plan` | Present plan (auto-approved) |
+
+## Named Tab Groups (multi-agent)
+
+Multiple agents — different repos, different sessions, different sub-agents — can share one Chrome instance without stepping on each other's tabs. The mechanism is **named tab groups**: each agent owns a group identified by a unique `groupName`. All groups live in one shared Chrome window; the group color visually distinguishes them in the tab strip.
+
+**Contract for every agent session:**
+
+```
+1. tabs_context_mcp({ groupName: "<your-name>", createIfEmpty: true, color: "<color>" })
+   → bootstraps the group if missing, returns your first tabId
+2. tabs_create_mcp({ groupName: "<your-name>" })
+   → adds another tab to YOUR group, returns its tabId
+3. navigate / computer / find / read_page / ... ({ tabId: <yours>, ... })
+   → operate only on tabIds you own
+```
+
+`groupName` is **required** for `tabs_create_mcp` and required when `createIfEmpty: true` on `tabs_context_mcp`. Calling `tabs_context_mcp()` with no arguments returns the topology of **all** groups currently managed by the extension (useful for orchestrators).
+
+**Pick a meaningful groupName.** Examples: `agent-foo`, `sergen-claude`, `research-bot`, `<repo-name>`. The group name is the per-tab metadata that distinguishes which agent owns which tab — both for the user (visible in the Chrome tab strip) and for any orchestrator inspecting the topology.
+
+**Pick a distinct color.** Valid: `grey`, `blue`, `red`, `yellow`, `green`, `pink`, `purple`, `cyan`, `orange`. Defaults to `blue`. Color is set on first creation and is also visible in the tab strip.
+
+**State persists.** The set of named groups is stored in `chrome.storage.local`. After a service-worker eviction or browser restart, the extension re-discovers its groups by name and rebuilds in-memory state. Agents reconnecting in a later session can pass the same `groupName` to resume.
+
+**Tab cleanup.** Closing the last tab in a group auto-removes the group (Chrome behavior). The extension drops the group from its persisted state. To intentionally end an agent's session, close all its tabs.
+
+**Concurrency.** All tool calls across different `tabId`s run in parallel through a single TCP / native-messaging pipe. A global creation mutex prevents two simultaneous bootstraps from spawning two browser windows; subsequent groups always reuse the existing host window.
 
 ## Updating After Code Changes
 
