@@ -383,12 +383,55 @@ function setupClientConnection(socket, initialBuffer) {
 
 // --- Client mode: connect to primary ---
 
+// After this many consecutive failed reconnects to the primary, try to bind
+// the port ourselves and promote to primary. This fixes the "primary died,
+// clients retry forever" availability bug — the port is free, so we should
+// take it over instead of waiting for nothing.
+const PROMOTE_AFTER_FAILED_RECONNECTS = 3;
+let clientReconnectAttempts = 0;
+
+async function tryPromoteToPrimary() {
+  return new Promise((resolve) => {
+    const onError = (err) => {
+      tcpServer.removeListener("listening", onListen);
+      if (err.code === "EADDRINUSE") {
+        // Another mcp-server beat us to the port. Stay as client, keep retrying.
+        process.stderr.write(`Port ${TCP_PORT} taken by another primary. Remaining as client.\n`);
+      } else {
+        process.stderr.write(`Failed to promote to primary: ${err.message}\n`);
+      }
+      resolve(false);
+    };
+    const onListen = () => {
+      tcpServer.removeListener("error", onError);
+      mode = "primary";
+      writePidfile();
+      process.stderr.write(`Promoted from client to primary on :${TCP_PORT}. Native host and future clients will now connect here.\n`);
+      resolve(true);
+    };
+    tcpServer.once("error", onError);
+    tcpServer.once("listening", onListen);
+    try {
+      tcpServer.listen(TCP_PORT, "127.0.0.1");
+    } catch (e) {
+      tcpServer.removeListener("error", onError);
+      tcpServer.removeListener("listening", onListen);
+      process.stderr.write(`Listen threw during promotion: ${e.message}\n`);
+      resolve(false);
+    }
+  });
+}
+
 function startClientMode() {
   mode = "client";
   process.stderr.write(`Port ${TCP_PORT} in use. Connecting as client to primary MCP server...\n`);
 
   function connect() {
+    let handshakeComplete = false;
+
     primarySocket = net.createConnection(TCP_PORT, "127.0.0.1", () => {
+      handshakeComplete = true;
+      clientReconnectAttempts = 0;
       process.stderr.write(`Connected to primary MCP server on :${TCP_PORT}\n`);
       // Send handshake
       primarySocket.write(JSON.stringify({ type: "client_hello" }) + "\n");
@@ -427,7 +470,7 @@ function startClientMode() {
       process.stderr.write(`Client connection error: ${err.message}\n`);
     });
 
-    primarySocket.on("close", () => {
+    primarySocket.on("close", async () => {
       primarySocket = null;
       // Primary died, reject pending requests
       for (const [, { reject, timer }] of pendingRequests) {
@@ -435,7 +478,25 @@ function startClientMode() {
         reject(new Error("Primary MCP server disconnected"));
       }
       pendingRequests.clear();
-      // Try to reconnect after a delay (primary might restart)
+
+      // Only count failed reconnect attempts — if we did handshake and then
+      // got dropped, that's a normal primary cycle, not a dead primary.
+      if (!handshakeComplete) {
+        clientReconnectAttempts++;
+      }
+
+      // After N failed attempts, try to become primary ourselves. The port
+      // is likely free (primary is gone). If another process beat us to it,
+      // EADDRINUSE throws and we stay client.
+      if (clientReconnectAttempts >= PROMOTE_AFTER_FAILED_RECONNECTS) {
+        const promoted = await tryPromoteToPrimary();
+        if (promoted) {
+          clientReconnectAttempts = 0;
+          return; // Stop the reconnect loop — we're primary now
+        }
+        clientReconnectAttempts = 0; // Reset so we don't promote every time
+      }
+
       setTimeout(connect, 2000);
     });
   }
@@ -789,6 +850,7 @@ server.tool(
   "Diagnose the open-claude-in-chrome stack. Returns: mcp-server mode + bind address, native-host connection status with timestamps, pending-request count, connected-client count, plus a best-effort probe of the extension itself (groups, attached tabs, version). Always returns local state even if the extension is unreachable. Includes an `advice` string with concrete next steps. Call this BEFORE falling back to another browser tool — it distinguishes transient issues (worker reconnecting, retry in a few seconds) from permanent ones (extension not installed, run install.sh).",
   {},
   async () => {
+    const isPrimary = mode === "primary";
     const local = {
       mode,
       bindAddress: "127.0.0.1",
@@ -796,20 +858,26 @@ server.tool(
       pid: process.pid,
       pidfilePath,
       uptimeSeconds: Math.floor((Date.now() - serverStartedAt) / 1000),
-      // Primary-mode fields: the local end of the one-and-only native host connection
-      nativeHostSocketConnected: !!(nativeHostSocket && !nativeHostSocket.destroyed),
-      nativeHostEverConnected,
-      lastNativeHostConnectAt: lastNativeHostConnectAt ? new Date(lastNativeHostConnectAt).toISOString() : null,
-      lastNativeHostConnectAgo: fmtAgo(lastNativeHostConnectAt),
-      lastNativeHostDisconnectAt: lastNativeHostDisconnectAt ? new Date(lastNativeHostDisconnectAt).toISOString() : null,
-      lastNativeHostDisconnectAgo: fmtAgo(lastNativeHostDisconnectAt),
-      lastNativeHostMessageAt: lastNativeHostMessageAt ? new Date(lastNativeHostMessageAt).toISOString() : null,
-      lastNativeHostMessageAgo: fmtAgo(lastNativeHostMessageAt),
       pendingRequestsCount: pendingRequests.size,
-      // Primary-only: how many other mcp-server.js processes are connected to us as clients
-      ...(mode === "primary" ? { connectedClientsCount: clientSockets.size } : {}),
-      // Client-only: is our TCP link to the primary alive
-      ...(mode === "client" ? { primarySocketAlive: !!(primarySocket && !primarySocket.destroyed) } : {}),
+      // Primary-only fields. In client mode these are meaningless (the client
+      // never accepts a native host connection; the primary does) so omitting
+      // them avoids the misleading `nativeHostEverConnected: false` report.
+      ...(isPrimary ? {
+        nativeHostSocketConnected: !!(nativeHostSocket && !nativeHostSocket.destroyed),
+        nativeHostEverConnected,
+        lastNativeHostConnectAt: lastNativeHostConnectAt ? new Date(lastNativeHostConnectAt).toISOString() : null,
+        lastNativeHostConnectAgo: fmtAgo(lastNativeHostConnectAt),
+        lastNativeHostDisconnectAt: lastNativeHostDisconnectAt ? new Date(lastNativeHostDisconnectAt).toISOString() : null,
+        lastNativeHostDisconnectAgo: fmtAgo(lastNativeHostDisconnectAt),
+        lastNativeHostMessageAt: lastNativeHostMessageAt ? new Date(lastNativeHostMessageAt).toISOString() : null,
+        lastNativeHostMessageAgo: fmtAgo(lastNativeHostMessageAt),
+        connectedClientsCount: clientSockets.size,
+      } : {}),
+      // Client-only
+      ...(isPrimary ? {} : {
+        primarySocketAlive: !!(primarySocket && !primarySocket.destroyed),
+        clientReconnectAttempts,
+      }),
     };
 
     let extension = null;
@@ -843,8 +911,24 @@ server.tool(
     if (extensionReachable) {
       advice = "All systems healthy. open-claude-in-chrome is fully operational.";
     } else if (mode === "client") {
-      advice = "Running as a client of another mcp-server.js (multi-session). " +
-        "If unhealthy, the primary may be in trouble. Check the primary's pidfile.";
+      // A client healthcheck probe that fails can mean two things:
+      //   (a) our TCP link to the primary is broken (we're retrying,
+      //       possibly self-promoting) — primarySocketAlive tells us
+      //   (b) the primary routed our request to its native host and got an
+      //       error back (extension side issue, same as a primary-mode failure)
+      if (!local.primarySocketAlive) {
+        advice = `CLIENT: this mcp-server is running as a client of another primary on :${TCP_PORT}, ` +
+          `but the TCP link to the primary is currently down (${clientReconnectAttempts} failed reconnects). ` +
+          `After ${PROMOTE_AFTER_FAILED_RECONNECTS} failed reconnects this client will try to promote itself to primary. ` +
+          "If still stuck: run `pkill -f \"node.*open-claude-in-chrome.*mcp-server\"` to kill all mcp-server processes " +
+          "and /mcp to reconnect — the fresh spawn will become primary and a new native-host connection from the " +
+          "extension will land there cleanly.";
+      } else {
+        advice = "CLIENT: TCP link to the primary is healthy, but the primary's extension probe failed. " +
+          "The primary's native host is down (extension disconnected from browser side). " +
+          `Primary error: ${extensionError}. ` +
+          "Fix on the primary: open any tab in Chrome to wake the service worker, or reload the extension at chrome://extensions.";
+      }
     } else if (!nativeHostEverConnected) {
       advice = "PERMANENT: extension has never connected to this MCP server. " +
         "Open Chrome / Brave / Edge, ensure the Open Claude in Chrome extension is enabled at chrome://extensions, " +
