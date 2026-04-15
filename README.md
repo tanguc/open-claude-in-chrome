@@ -136,30 +136,32 @@ The 18 tools from Claude in Chrome, plus `healthcheck` (this fork):
 
 ## Named Tab Groups (multi-agent)
 
-Multiple agents — different repos, different sessions, different sub-agents — can share one Chrome instance without stepping on each other's tabs. The mechanism is **named tab groups**: each agent owns a group identified by a unique `groupName`. All groups live in one shared Chrome window; the group color visually distinguishes them in the tab strip.
+Multiple agents — different repos, different sessions, different sub-agents — can share one Chrome instance without stepping on each other's tabs. The mechanism is **named tab groups**: each agent owns a group identified by a unique `groupName`, and each group lives in its **own dedicated browser window**. Spread them across monitors, minimize the ones you aren't watching, close an agent's window to end its session — they're first-class Chrome windows.
 
 **Contract for every agent session:**
 
 ```
 1. tabs_context_mcp({ groupName: "<your-name>", createIfEmpty: true, color: "<color>" })
-   → bootstraps the group if missing, returns your first tabId
+   → opens a new browser window, creates the named group inside it, returns your first tabId
 2. tabs_create_mcp({ groupName: "<your-name>" })
-   → adds another tab to YOUR group, returns its tabId
+   → adds another tab to YOUR group (in YOUR window), returns its tabId
 3. navigate / computer / find / read_page / ... ({ tabId: <yours>, ... })
    → operate only on tabIds you own
 ```
 
 `groupName` is **required** for `tabs_create_mcp` and required when `createIfEmpty: true` on `tabs_context_mcp`. Calling `tabs_context_mcp()` with no arguments returns the topology of **all** groups currently managed by the extension (useful for orchestrators).
 
-**Pick a meaningful groupName.** Examples: `agent-foo`, `sergen-claude`, `research-bot`, `<repo-name>`. The group name is the per-tab metadata that distinguishes which agent owns which tab — both for the user (visible in the Chrome tab strip) and for any orchestrator inspecting the topology.
+**Pick a meaningful groupName.** Examples: `agent-foo`, `sergen-claude`, `research-bot`, `<repo-name>`. The group name is the per-tab metadata that distinguishes which agent owns which tab — both for the user (visible as the window's tab-group label in the Chrome tab strip) and for any orchestrator inspecting the topology.
 
 **Pick a distinct color.** Valid: `grey`, `blue`, `red`, `yellow`, `green`, `pink`, `purple`, `cyan`, `orange`. Defaults to `blue`. Color is set on first creation and is also visible in the tab strip.
 
-**State persists.** The set of named groups is stored in `chrome.storage.local`. After a service-worker eviction or browser restart, the extension re-discovers its groups by name and rebuilds in-memory state. Agents reconnecting in a later session can pass the same `groupName` to resume.
+**One group = one window.** Every bootstrap spawns a fresh Chrome window containing one blank tab, and immediately wraps that tab in the named group. Parallel bootstraps don't coordinate — they each create their own window independently. This makes it easy to spatially separate agents (drag to different monitors, stack vs tile, etc.) and to end an agent's session by simply closing its window.
 
-**Tab cleanup.** Closing the last tab in a group auto-removes the group (Chrome behavior). The extension drops the group from its persisted state. To intentionally end an agent's session, close all its tabs.
+**State persists.** The set of named groups is stored in `chrome.storage.local`. After a service-worker eviction or browser restart, the extension re-discovers its groups by name and rebuilds in-memory state. Agents reconnecting in a later session can pass the same `groupName` to resume (Chrome will have re-opened the window on its side; if the window was closed, a new one is created on the next bootstrap).
 
-**Concurrency.** All tool calls across different `tabId`s run in parallel through a single TCP / native-messaging pipe. A global creation mutex prevents two simultaneous bootstraps from spawning two browser windows; subsequent groups always reuse the existing host window.
+**Tab cleanup.** Closing the last tab in a group auto-removes the group and its containing window (Chrome behavior). The extension drops the group from its persisted state on `chrome.tabs.onRemoved`. To intentionally end an agent's session, close its window.
+
+**Concurrency.** All tool calls across different `tabId`s run in parallel through a single TCP / native-messaging pipe; the mcp-server tracks each in-flight request by ID and the extension's async tool handlers execute them independently. The per-name de-dup lock prevents two concurrent bootstraps for the same `groupName` from racing.
 
 ## Updating After Code Changes
 

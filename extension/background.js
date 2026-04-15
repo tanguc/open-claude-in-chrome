@@ -16,13 +16,10 @@ const VALID_GROUP_COLORS = ["grey", "blue", "red", "yellow", "green", "pink", "p
 
 // groupName -> { id: <chrome tabGroupId>, color: string, tabIds: Set<number> }
 const groupsByName = new Map();
-// Per-name de-dup: callers asking for the same name share one in-flight promise
+// Per-name de-dup: callers asking for the same name share one in-flight promise.
+// Concurrent bootstraps with DIFFERENT names race independently — each creates
+// its own dedicated browser window, there is no shared "host window" to serialize.
 const groupCreationLocks = new Map();
-// Global creation mutex: serializes all NEW group creations so two concurrent
-// bootstraps from an empty state can't both spawn a host window. Once any group
-// exists, subsequent creates inside the locked section see the host window and
-// reuse it.
-let creationMutex = Promise.resolve();
 // Init promise, awaited in handleToolRequest before processing any tool
 let stateLoaded = null;
 
@@ -172,51 +169,21 @@ async function ensureNamedGroup(name, color) {
   if (groupCreationLocks.has(trimmed)) return groupCreationLocks.get(trimmed);
 
   const promise = (async () => {
-    // Acquire the global creation mutex so concurrent first-time bootstraps
-    // can't both spawn a host window. Pattern: chain a new promise onto the
-    // mutex, await the previous tail, run, then release.
-    const previousTail = creationMutex;
-    let release;
-    creationMutex = new Promise((r) => { release = r; });
-    await previousTail;
+    // One group = one window. Each bootstrap spawns its own dedicated Chrome
+    // window so agents working in parallel have visually distinct browsers
+    // (e.g. spread across monitors or treated as independent processes by
+    // the user). Concurrent bootstraps with different groupNames each create
+    // their own window independently — no shared state, no mutex needed.
+    const finalColor = validatedColor || DEFAULT_GROUP_COLOR;
+    const win = await chrome.windows.create({ focused: true, url: "about:blank" });
+    const tab = win.tabs[0];
 
-    try {
-      // Re-check after acquiring: while we waited, another caller may have
-      // created our exact name OR established a host window we should reuse.
-      const recheck = await refreshGroupMeta(trimmed);
-      if (recheck) return recheck;
-
-      const finalColor = validatedColor || DEFAULT_GROUP_COLOR;
-
-      // Reuse an existing window that already hosts one of our groups so all
-      // named groups live side-by-side in one tab strip. Only spawn a fresh
-      // window if no host window exists yet.
-      let hostWindowId = null;
-      for (const meta of groupsByName.values()) {
-        try {
-          const g = await chrome.tabGroups.get(meta.id);
-          hostWindowId = g.windowId;
-          break;
-        } catch {}
-      }
-
-      let tab;
-      if (hostWindowId !== null) {
-        tab = await chrome.tabs.create({ active: true, windowId: hostWindowId, url: "about:blank" });
-      } else {
-        const win = await chrome.windows.create({ focused: true, url: "about:blank" });
-        tab = win.tabs[0];
-      }
-
-      const groupId = await chrome.tabs.group({ tabIds: [tab.id] });
-      await chrome.tabGroups.update(groupId, { title: trimmed, color: finalColor });
-      const meta = { id: groupId, color: finalColor, tabIds: new Set([tab.id]) };
-      groupsByName.set(trimmed, meta);
-      await persistGroupsState();
-      return meta;
-    } finally {
-      release();
-    }
+    const groupId = await chrome.tabs.group({ tabIds: [tab.id] });
+    await chrome.tabGroups.update(groupId, { title: trimmed, color: finalColor });
+    const meta = { id: groupId, color: finalColor, tabIds: new Set([tab.id]) };
+    groupsByName.set(trimmed, meta);
+    await persistGroupsState();
+    return meta;
   })();
 
   groupCreationLocks.set(trimmed, promise);
