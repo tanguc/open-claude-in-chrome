@@ -628,7 +628,18 @@ server.tool(
   async (args) => callTool("tabs_create_mcp", args)
 );
 
-// 3. navigate
+// 3. close_tabs
+server.tool(
+  "close_tabs",
+  "Close tabs that this extension manages. Call at session end to tear down your agent's workspace cleanly. Provide EXACTLY ONE of:\n- `groupName`: closes ALL tabs in that named group. Since one group = one Chrome window, this also closes the window and removes the group from persisted state.\n- `tabIds`: closes specific tab ids. Every id must belong to one of this extension's managed groups (any group, not just yours — but typically you'd only pass your own tabIds). Closing an unmanaged tab is rejected.\n\nChrome auto-removes a tab group when its last tab closes, and the extension's onRemoved listener drops the group from its persisted state automatically. The tool is idempotent: closing a group that doesn't exist is a no-op with a message.",
+  {
+    groupName: z.string().optional().describe("Name of the group whose tabs (and therefore window) to close. Mutually exclusive with tabIds."),
+    tabIds: z.array(z.number()).optional().describe("Specific tab ids to close. Every id must belong to a managed group. Mutually exclusive with groupName."),
+  },
+  async (args) => callTool("close_tabs", args)
+);
+
+// 4. navigate
 server.tool(
   "navigate",
   'Navigate to a URL, or go forward/back in browser history. If you don\'t have a valid tab ID, use tabs_context_mcp first to get available tabs.',

@@ -584,6 +584,83 @@ const toolHandlers = {
     return result;
   },
 
+  async close_tabs(args) {
+    const { groupName, tabIds } = args || {};
+    const hasGroup = typeof groupName === "string" && groupName.trim() !== "";
+    const hasTabs = Array.isArray(tabIds) && tabIds.length > 0;
+
+    if (hasGroup === hasTabs) {
+      throw new Error("Provide exactly one of { groupName } or { tabIds: [...] }.");
+    }
+
+    async function closeOne(id) {
+      if (attachedTabs.has(id)) {
+        try { await chrome.debugger.detach({ tabId: id }); } catch {}
+        attachedTabs.delete(id);
+      }
+      try { await chrome.tabs.remove(id); return true; } catch { return false; }
+    }
+
+    if (hasGroup) {
+      const trimmed = validateGroupName(groupName);
+      const meta = await refreshGroupMeta(trimmed);
+      if (!meta) {
+        return {
+          content: [{ type: "text", text: `No MCP-managed group named "${trimmed}" exists. Nothing to close.` }],
+        };
+      }
+      const ids = Array.from(meta.tabIds);
+      let closedCount = 0;
+      for (const id of ids) {
+        if (await closeOne(id)) closedCount++;
+      }
+      // Proactively remove from state. The chrome.tabs.onRemoved listener
+      // will also fire for each tab and do the same cleanup — it's idempotent.
+      groupsByName.delete(trimmed);
+      await persistGroupsState();
+      return {
+        content: [{
+          type: "text",
+          text: `Closed ${closedCount}/${ids.length} tab(s) in group "${trimmed}". Chrome will auto-remove the window since the last tab in the group is gone. Group removed from persisted state.`,
+        }],
+      };
+    }
+
+    // hasTabs path
+    const rejected = [];
+    const accepted = [];
+    for (const id of tabIds) {
+      if (typeof id !== "number" || !Number.isFinite(id)) {
+        rejected.push({ id, reason: "not a number" });
+        continue;
+      }
+      const ownedBy = await findGroupForTab(id);
+      if (!ownedBy) {
+        rejected.push({ id, reason: "not in any MCP-managed group" });
+      } else {
+        accepted.push({ id, name: ownedBy.name });
+      }
+    }
+
+    if (rejected.length > 0) {
+      throw new Error(
+        `Refusing to close tabs that aren't in an MCP-managed group: ${rejected.map((r) => `${r.id} (${r.reason})`).join(", ")}`
+      );
+    }
+
+    let closedCount = 0;
+    for (const { id } of accepted) {
+      if (await closeOne(id)) closedCount++;
+    }
+    // onRemoved listener will clean up groupsByName entries per tab.
+    return {
+      content: [{
+        type: "text",
+        text: `Closed ${closedCount}/${accepted.length} tab(s). Groups that become empty are auto-removed from state by the onRemoved listener.`,
+      }],
+    };
+  },
+
   async navigate(args) {
     const { url, tabId } = args;
     if (!(await isInOurGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in any MCP-managed tab group.` }] };
