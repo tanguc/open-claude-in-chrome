@@ -141,9 +141,8 @@ console.log("== sessions differ from one another (persona) ==");
      `slowest tier types 15 chars in ${typeMs("relaxed")}ms planned — stays under the ~4s line that got a tier cut`);
   ok(typeMs("fastest") < typeMs("fast") && typeMs("fast") < typeMs("natural"),
      "typing still gets monotonically slower across the tiers");
-  // A default that costs a lot is a default nobody keeps.
   const { DEFAULT_TEMPO } = await import("../extension/humanize/index.js");
-  ok(DEFAULT_TEMPO === "fast", "the cheaper tier is the default");
+  ok(DEFAULT_TEMPO === "natural", "the source default uses the natural tier");
 }
 
 // ---- a pinned seed makes the hand reproducible ------------------------------

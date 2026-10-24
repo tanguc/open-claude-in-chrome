@@ -67,7 +67,7 @@ let humanSessionSeed = null; // the seed the live session was built from
  * controlled comparison can hold the hand fixed and vary only the tier.
  */
 function human(speed, seed) {
-  const tier = speed || "fast";
+  const tier = speed || humanize.DEFAULT_TEMPO;
   const wantSeed = typeof seed === "number" ? seed : null;
   if (!humanSession || wantSeed !== humanSessionSeed) {
     humanSession = humanize.createSession(wantSeed === null ? undefined : wantSeed, tier);
@@ -828,10 +828,10 @@ const CONFIG_SCHEMA = {
     "with a real press dwell, scrolls decomposed into momentum ticks, and typing " +
     "with per-character keydown/keyup and human inter-key timing. Outcomes are " +
     "identical (same element, same text, same scroll position) — only the motion " +
-    "and timing change, so actions take noticeably longer. Default false.",
+    "and timing change, so actions take noticeably longer. Default true.",
   humanize_speed:
     "How much time humanized motion is allowed to take, fastest to slowest: " +
-    "\"fastest\", \"fast\" (default), \"natural\", \"relaxed\". Higher tiers " +
+    "\"fastest\", \"fast\", \"natural\" (default), \"relaxed\". Higher tiers " +
     "spend more time and draw cursor paths with more samples. \"natural\" is " +
     "genuine human cadence; \"fastest\" keeps the shape of human motion but " +
     "compresses it, for when there is a lot to get through. Every tier keeps " +
@@ -851,8 +851,14 @@ const CONFIG_SCHEMA = {
 };
 
 const AUDIT_MODES = ["off", "audit"];
+const DEFAULT_CONFIG = Object.freeze({
+  humanize: true,
+  humanize_speed: "natural",
+  humanize_seed: null,
+  audit_mode: "off"
+});
 let configState = {
-  default: { humanize: false, humanize_speed: "fast", humanize_seed: null, audit_mode: "off" },
+  default: { ...DEFAULT_CONFIG },
   byTab: {}
 };
 let configHydrated = null;
@@ -863,7 +869,7 @@ async function hydrateConfig() {
     const session = await chrome.storage.session.get(TAB_CONFIG_KEY);
     configState = {
       default: {
-        humanize: false, humanize_speed: "fast", humanize_seed: null, audit_mode: "off",
+        ...DEFAULT_CONFIG,
         ...(local[CONFIG_KEY] || {})
       },
       byTab: session[TAB_CONFIG_KEY] || {}
@@ -878,7 +884,7 @@ configHydrated = hydrateConfig().then((c) => {
 });
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && changes[CONFIG_KEY]) {
-    configState.default = { humanize: false, audit_mode: "off", ...(changes[CONFIG_KEY].newValue || {}) };
+    configState.default = { ...DEFAULT_CONFIG, ...(changes[CONFIG_KEY].newValue || {}) };
     audit.setEnabled(configState.default.audit_mode === "audit");
   }
   if (area === "session" && changes[TAB_CONFIG_KEY]) {
@@ -888,7 +894,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
 
 /** Per-tab overrides win over the default. */
 function effectiveConfig(tabId) {
-  return { ...configState.default, ...(configState.byTab[String(tabId)] || {}) };
+  return { ...DEFAULT_CONFIG, ...configState.default, ...(configState.byTab[String(tabId)] || {}) };
 }
 
 async function humanizeOn(tabId) {

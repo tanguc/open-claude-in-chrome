@@ -36,7 +36,8 @@ const isInGroup = async (id) => state.tabs.some(t=>t.id===id);
 const formatTabContext = (tabs) => ({content:[{type:"text",text:JSON.stringify({availableTabs:tabs.map(t=>({tabId:t.id}))})}]});
 const CONFIG_KEY="ocic_config_v1", TAB_CONFIG_KEY="ocic_tab_config_v1";
 const CONFIG_SCHEMA={humanize:"drive input like a person"};
-let configState={default:{humanize:false,humanize_speed:"fast",humanize_seed:null},byTab:{}};
+const DEFAULT_CONFIG={humanize:true,humanize_speed:"natural",humanize_seed:null,audit_mode:"off"};
+let configState={default:{...DEFAULT_CONFIG},byTab:{}};
 const configHydrated=Promise.resolve();
 // get_config reports the live humanization persona; give the harness one so the
 // handler can be exercised the same way the extension runs it.
@@ -54,10 +55,10 @@ const src = [
   extractFunction("writeConfig")
 ].join("\n\n");
 const mk = new Function("chrome","mcpGroups","isInGroup","formatTabContext",
-  "CONFIG_KEY","TAB_CONFIG_KEY","CONFIG_SCHEMA","configState","configHydrated","humanSession","humanSessionSeed","human",
+  "CONFIG_KEY","TAB_CONFIG_KEY","CONFIG_SCHEMA","configState","configHydrated","humanSession","humanSessionSeed","human","DEFAULT_CONFIG",
   src + "; return { H_tabs_create_mcp, H_set_tab_focus, H_get_config, H_set_config, effectiveConfig, writeConfig };");
 const H = mk(globalThis.chrome, mcpGroups, isInGroup, formatTabContext,
-  CONFIG_KEY, TAB_CONFIG_KEY, CONFIG_SCHEMA, configState, configHydrated, humanSession, humanSessionSeed, human);
+  CONFIG_KEY, TAB_CONFIG_KEY, CONFIG_SCHEMA, configState, configHydrated, humanSession, humanSessionSeed, human, DEFAULT_CONFIG);
 
 console.log("== #28: creating a tab must not select it or steal focus ==");
 api.length=0;
@@ -88,7 +89,9 @@ const r3 = await H.H_set_tab_focus.set_tab_focus({tabId:4242});
 ok(/not in the MCP group/.test(r3.content[0].text), "out-of-group tab rejected");
 
 console.log("== config: default vs per-tab layering ==");
-ok(H.effectiveConfig(100).humanize===false, "default humanize is false (opt-in)");
+ok(H.effectiveConfig(100).humanize===true && H.effectiveConfig(100).humanize_speed==="natural", "source defaults enable natural humanization");
+await H.writeConfig("humanize", false, undefined);
+ok(H.effectiveConfig(100).humanize===false, "an explicit default can disable humanization");
 await H.writeConfig("humanize", true, undefined);
 ok(H.effectiveConfig(100).humanize===true, "setting the default applies to a tab");
 await H.writeConfig("humanize", false, 100);

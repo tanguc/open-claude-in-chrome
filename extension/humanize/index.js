@@ -50,10 +50,7 @@ export { sampleInBox };
  *   time   scales every delay (approach, dwell, inter-key, scroll ticks)
  *   points scales how many samples a cursor path is drawn with
  *
- * `fast` is the default, because turning humanization on should not cost a
- * multiple of what it saves. It keeps everything that matters — movement
- * before the click, a landing point inside the target, real key events,
- * identical outcomes — with fewer samples and shorter pauses, never none.
+ * `natural` is the source default; runtime settings can choose another tier
  */
 export const TEMPOS = {
   //          time  = cursor/scroll/dwell delays   (cost is per ACTION)
@@ -64,7 +61,7 @@ export const TEMPOS = {
   natural: { time: 1, keys: 1 },
   relaxed: { time: 1.5, keys: 1.12 }
 };
-export const DEFAULT_TEMPO = "fast";
+export const DEFAULT_TEMPO = "natural";
 
 /**
  * One "hand" per session: a seeded rng plus a persona (tempo, steadiness,

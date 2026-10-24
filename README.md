@@ -445,13 +445,15 @@ cursor teleports to a target, the button is pressed and released instantly, a
 scroll arrives as one jump. That is efficient, and it looks nothing like a
 person.
 
-Turn `humanize` on and input is driven the way a hand drives it — curved cursor
-paths with acceleration and overshoot, clicks that land off-centre with a real
-press dwell, scrolls decomposed into momentum ticks, and typing with
-human-shaped inter-key timing:
+This fork enables `humanize` at the `natural` speed by default in source. Input
+uses curved cursor paths, press dwell and per-character timing. Explicit saved
+settings and per-tab overrides still take precedence; changing the source does
+not overwrite them. Audit and demonstration recording remain off.
 
-```
-set_config({ key: "humanize", value: true })
+To disable humanization explicitly:
+
+```javascript
+set_config({ key: "humanize", value: false })
 ```
 
 Measured on an instrumented page, the same three clicks produce **3 mouse-move
@@ -465,8 +467,8 @@ Realism costs wall-clock, so the time affordance is a setting:
 | `humanize_speed` | |
 |---|---|
 | `fastest` | The shape of human motion, compressed — for getting through a lot |
-| `fast` *(default)* | Fewer path samples and shorter pauses |
-| `natural` | Genuine human cadence |
+| `fast` | Fewer path samples and shorter pauses |
+| `natural` *(default)* | Genuine human cadence |
 | `relaxed` | Unhurried motion (typing stays near natural — see below) |
 
 Every tier keeps movement before the click, real key events and identical
