@@ -7,7 +7,6 @@
 // z.object(paramShape) yields the full input schema.
 
 import { z } from "zod";
-import { zodToJsonSchema } from "zod-to-json-schema";
 
 export const TOOLS = [
   {
@@ -647,14 +646,13 @@ export const TOOLS = [
  * MCP tools/list, codemode TS-API generation, etc.
  */
 export function toolInputJsonSchema(tool) {
-  const schema = zodToJsonSchema(z.object(tool.paramShape), {
-    target: "openApi3",
-    $refStrategy: "none"
+  const schema = z.toJSONSchema(z.object(tool.paramShape), {
+    target: "draft-7",
+    io: "input",
+    reused: "inline",
+    cycles: "throw"
   });
-  // zodToJsonSchema wraps with $schema by default; strip it for cleanliness
-  if (schema && typeof schema === "object") {
-    delete schema.$schema;
-  }
+  delete schema.$schema;
   return schema;
 }
 
@@ -693,6 +691,9 @@ function tsType(schema) {
     return schema.enum.map((v) => JSON.stringify(v)).join(" | ");
   }
   if (schema.const !== undefined) return JSON.stringify(schema.const);
+  if (Array.isArray(schema.type)) {
+    return schema.type.map((type) => tsType({ ...schema, type })).join(" | ");
+  }
   if (schema.anyOf || schema.oneOf) {
     const variants = (schema.anyOf || schema.oneOf).map(tsType);
     return variants.join(" | ");
@@ -705,6 +706,8 @@ function tsType(schema) {
       return "number";
     case "boolean":
       return "boolean";
+    case "null":
+      return "null";
     case "array":
       return `(${tsType(schema.items || {})})[]`;
     case "object": {

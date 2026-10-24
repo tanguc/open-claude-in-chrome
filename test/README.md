@@ -24,6 +24,14 @@ brace-matching. That indirection is deliberate: `background.js` is a service
 worker with no exports whose top level touches `chrome.*` immediately, so this
 lets the tests exercise the shipped source instead of a copy that could drift.
 
+## Configuration and schema regressions
+
+`default-config.test.mjs` tests the shipped configuration section and planner: humanization is enabled at natural speed on a fresh profile, after partial storage changes and after a reset. Explicit stored global and per-tab choices remain authoritative. Auditing stays off by default.
+
+`host/test/schemas.test.mjs` checks all 28 tool contracts captured before the Zod 4 migration, validates the generated JSON Schemas, exercises required fields and constraints, and checks codemode/hybrid TypeScript input types. The stdio MCP test compares every schema actually advertised by the server with the shared exported catalog.
+
 ## Dependency audit
 
-The host lockfile retains Zod 3 for compatibility with `zod-to-json-schema`. As of 2026-10-24, `npm audit --prefix host --omit=dev` reports one high-severity advisory, [GHSA-mrhx-c7xc-m3w5](https://github.com/advisories/GHSA-mrhx-c7xc-m3w5). npm proposes Zod 4.6.7, a major migration that needs schema-conversion tests before adoption. The other nine alerts inherited from the upstream host lockfile were fixed with compatible updates; passing tests do not mean the dependency audit is clean.
+The host uses Zod 4.6.7 or later and native `z.toJSONSchema` conversion in Draft 7 input mode. The application's direct `zod-to-json-schema` dependency is removed; the MCP SDK still carries that package transitively for its legacy compatibility path.
+
+On 2026-10-25, `npm audit --prefix host --omit=dev` reports zero known vulnerabilities, including resolution of [GHSA-mrhx-c7xc-m3w5](https://github.com/advisories/GHSA-mrhx-c7xc-m3w5). This result applies to the host dependency tree, not to a full code audit or the separate codemode worker dependency tree.

@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { toolsAsJsonSchemaList } from "../tool-definitions.js";
 
 test("the stdio MCP server advertises the fork contracts over the real protocol", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "ocic-mcp-"));
@@ -28,6 +29,14 @@ test("the stdio MCP server advertises the fork contracts over the real protocol"
     const { tools } = await client.listTools();
     const names = new Map(tools.map((tool) => [tool.name, tool]));
     assert.equal(names.size, tools.length);
+    const expected = toolsAsJsonSchemaList();
+    assert.equal(tools.length, expected.length);
+    for (const tool of expected) {
+      const schema = structuredClone(names.get(tool.name)?.inputSchema);
+      assert(schema, `missing schema for ${tool.name}`);
+      delete schema.$schema;
+      assert.deepEqual(schema, tool.inputSchema, `wire schema drift for ${tool.name}`);
+    }
     for (const name of ["healthcheck", "close_tabs", "tabs_close_mcp", "file_upload", "debug"]) {
       assert(names.has(name), `missing ${name}`);
     }

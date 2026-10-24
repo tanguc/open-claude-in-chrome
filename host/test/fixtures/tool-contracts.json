@@ -1,0 +1,307 @@
+[
+  {
+    "name": "tabs_context_mcp",
+    "params": [
+      "color",
+      "createIfEmpty",
+      "groupName"
+    ],
+    "required": []
+  },
+  {
+    "name": "tabs_create_mcp",
+    "params": [
+      "color",
+      "groupName"
+    ],
+    "required": [
+      "groupName"
+    ]
+  },
+  {
+    "name": "close_tabs",
+    "params": [
+      "groupName",
+      "tabIds"
+    ],
+    "required": []
+  },
+  {
+    "name": "healthcheck",
+    "params": [],
+    "required": []
+  },
+  {
+    "name": "debug_timings",
+    "params": [
+      "clear",
+      "limit"
+    ],
+    "required": []
+  },
+  {
+    "name": "tabs_close_mcp",
+    "params": [
+      "tabId",
+      "tabIds"
+    ],
+    "required": []
+  },
+  {
+    "name": "navigate",
+    "params": [
+      "tabId",
+      "url"
+    ],
+    "required": [
+      "tabId",
+      "url"
+    ]
+  },
+  {
+    "name": "computer",
+    "params": [
+      "action",
+      "coordinate",
+      "duration",
+      "modifiers",
+      "ref",
+      "region",
+      "repeat",
+      "save_to_disk",
+      "scroll_amount",
+      "scroll_direction",
+      "start_coordinate",
+      "tabId",
+      "text"
+    ],
+    "required": [
+      "action",
+      "tabId"
+    ]
+  },
+  {
+    "name": "find",
+    "params": [
+      "query",
+      "tabId"
+    ],
+    "required": [
+      "query",
+      "tabId"
+    ]
+  },
+  {
+    "name": "form_input",
+    "params": [
+      "ref",
+      "tabId",
+      "value"
+    ],
+    "required": [
+      "ref",
+      "tabId",
+      "value"
+    ]
+  },
+  {
+    "name": "get_page_text",
+    "params": [
+      "tabId"
+    ],
+    "required": [
+      "tabId"
+    ]
+  },
+  {
+    "name": "gif_creator",
+    "params": [
+      "action",
+      "download",
+      "filename",
+      "options",
+      "tabId"
+    ],
+    "required": [
+      "action",
+      "tabId"
+    ]
+  },
+  {
+    "name": "javascript_tool",
+    "params": [
+      "action",
+      "tabId",
+      "text"
+    ],
+    "required": [
+      "action",
+      "tabId",
+      "text"
+    ]
+  },
+  {
+    "name": "read_console_messages",
+    "params": [
+      "clear",
+      "limit",
+      "onlyErrors",
+      "pattern",
+      "tabId"
+    ],
+    "required": [
+      "tabId"
+    ]
+  },
+  {
+    "name": "read_network_requests",
+    "params": [
+      "clear",
+      "limit",
+      "tabId",
+      "urlPattern"
+    ],
+    "required": [
+      "tabId"
+    ]
+  },
+  {
+    "name": "read_page",
+    "params": [
+      "depth",
+      "filter",
+      "max_chars",
+      "ref_id",
+      "tabId"
+    ],
+    "required": [
+      "tabId"
+    ]
+  },
+  {
+    "name": "resize_window",
+    "params": [
+      "height",
+      "tabId",
+      "width"
+    ],
+    "required": [
+      "height",
+      "tabId",
+      "width"
+    ]
+  },
+  {
+    "name": "shortcuts_list",
+    "params": [
+      "tabId"
+    ],
+    "required": [
+      "tabId"
+    ]
+  },
+  {
+    "name": "shortcuts_execute",
+    "params": [
+      "command",
+      "shortcutId",
+      "tabId"
+    ],
+    "required": [
+      "tabId"
+    ]
+  },
+  {
+    "name": "switch_browser",
+    "params": [],
+    "required": []
+  },
+  {
+    "name": "update_plan",
+    "params": [
+      "approach",
+      "domains"
+    ],
+    "required": [
+      "approach",
+      "domains"
+    ]
+  },
+  {
+    "name": "debug",
+    "params": [
+      "clear",
+      "filter",
+      "kind",
+      "limit",
+      "since_ms",
+      "tabId"
+    ],
+    "required": []
+  },
+  {
+    "name": "get_config",
+    "params": [
+      "tabId"
+    ],
+    "required": []
+  },
+  {
+    "name": "set_config",
+    "params": [
+      "key",
+      "tabId",
+      "value"
+    ],
+    "required": [
+      "key",
+      "value"
+    ]
+  },
+  {
+    "name": "set_tab_focus",
+    "params": [
+      "focus_window",
+      "tabId"
+    ],
+    "required": [
+      "tabId"
+    ]
+  },
+  {
+    "name": "upload_image",
+    "params": [
+      "filename",
+      "imageId",
+      "ref",
+      "tabId"
+    ],
+    "required": [
+      "imageId",
+      "ref",
+      "tabId"
+    ]
+  },
+  {
+    "name": "retranscribe_recording",
+    "params": [
+      "recording_id"
+    ],
+    "required": [
+      "recording_id"
+    ]
+  },
+  {
+    "name": "file_upload",
+    "params": [
+      "paths",
+      "ref",
+      "tabId"
+    ],
+    "required": [
+      "paths",
+      "ref",
+      "tabId"
+    ]
+  }
+]

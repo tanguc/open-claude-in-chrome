@@ -14,7 +14,9 @@ The wire protocol is newline-delimited JSON between runtime and host. Browser na
 
 ## Shared frontends
 
-`host/tool-definitions.js` holds schemas used by the standard, hybrid and codemode servers. `host/tool-runtime.js` manages the client connection, argument coercion, pending calls and recording events. Frontends use it in-process, not through a child stdio MCP server.
+`host/tool-definitions.js` holds Zod 4 schemas used by the standard, hybrid and codemode servers. Native `z.toJSONSchema` emits Draft 7 input schemas with inline reuse and rejects cycles or unrepresentable types instead of weakening them. The TypeScript description generator handles primitive type arrays and real null. All 28 exported schemas are compared with the actual stdio MCP catalog in tests.
+
+`host/tool-runtime.js` manages the client connection, argument coercion, pending calls and recording events. Frontends use it in-process, not through a child stdio MCP server.
 
 The standard frontend exposes individual browser tools. Hybrid adds `execute_code` and recording channels. Codemode exposes the sandbox interface. The latter two launch a local workerd sidecar through Wrangler; browser tool callbacks return to the same runtime over a local HTTP proxy. Starting that sidecar is separate from testing the direct tools.
 
