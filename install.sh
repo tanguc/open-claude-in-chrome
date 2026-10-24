@@ -29,21 +29,8 @@ fi
 EXTENSION_IDS=("$@")
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 HOST_DIR="$SCRIPT_DIR/host"
+NATIVE_HOST_PATH="$HOST_DIR/native-host-wrapper.sh"
 HOST_NAME="com.anthropic.open_claude_in_chrome"
-
-# The native host is launched BY THE BROWSER (a sandboxed GUI app), not by your
-# shell. On macOS, TCC forbids GUI apps from reading/executing on removable or
-# network volumes (/Volumes/*) unless explicitly granted. So if this repo lives
-# on an external SSD — directly or via a ~ symlink — the browser cannot execute a
-# native host stored inside it: connectNative dies immediately with "Native host
-# has exited". To stay robust regardless of where the repo lives, install the
-# native host into a stable internal per-user location and point the manifests
-# there. (native-host.js has no npm deps, so a plain copy is self-contained.)
-case "$(uname)" in
-  Darwin) INSTALL_DIR="$HOME/Library/Application Support/open-claude-in-chrome" ;;
-  *)      INSTALL_DIR="$HOME/.local/share/open-claude-in-chrome" ;;
-esac
-NATIVE_HOST_PATH="$INSTALL_DIR/native-host-wrapper.sh"
 
 # Verify node is available
 if ! command -v node &> /dev/null; then
@@ -58,32 +45,15 @@ if [ ! -d "$HOST_DIR/node_modules" ]; then
   cd "$SCRIPT_DIR"
 fi
 
-# Install the native host onto the internal disk (see note above). The repo copy
-# stays the source of truth; edits to host/native-host.js require re-running this
-# script to refresh the installed copy.
-mkdir -p "$INSTALL_DIR"
-cp "$HOST_DIR/native-host.js" "$INSTALL_DIR/native-host.js"
-
-# Create the native host wrapper script. The browser launches this via native
-# messaging — it needs an absolute path to node and to the installed script.
+# Create the native host wrapper script
+# Chrome launches this via native messaging — it needs to find node and the script.
 cat > "$NATIVE_HOST_PATH" << WRAPPER
 #!/bin/sh
-exec "$(which node)" "$INSTALL_DIR/native-host.js"
+exec "$(which node)" "$HOST_DIR/native-host.js"
 WRAPPER
 chmod +x "$NATIVE_HOST_PATH"
 
-echo "Installed native host to internal disk: $INSTALL_DIR"
-
-# Warn if the repo itself resolves onto a removable/external volume — that is
-# exactly the setup this internal install protects against.
-REAL_HOST_DIR="$(cd "$HOST_DIR" && pwd -P)"
-case "$REAL_HOST_DIR" in
-  /Volumes/*)
-    echo "  Note: repo resolves to $REAL_HOST_DIR (external/removable volume)."
-    echo "  The native host was installed internally so the browser can execute it"
-    echo "  (macOS TCC blocks GUI apps from running binaries on /Volumes/*)."
-    ;;
-esac
+echo "Created native host wrapper: $NATIVE_HOST_PATH"
 
 # Build allowed_origins array from all extension IDs
 ORIGINS=""

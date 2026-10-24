@@ -8,79 +8,39 @@ self.addEventListener("unhandledrejection", (event) => {
 
 const NATIVE_HOST_NAME = "com.anthropic.open_claude_in_chrome";
 
-// --- Multi-group state ---
-// Each agent owns a named tab group. groupName is the identity and the per-tab
-// metadata: any tab inside a named group "belongs to" the agent that named it.
-const DEFAULT_GROUP_COLOR = "blue";
-const VALID_GROUP_COLORS = ["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"];
-
-// groupName -> { id: <chrome tabGroupId>, color: string, tabIds: Set<number> }
-const groupsByName = new Map();
-// Per-name de-dup: callers asking for the same name share one in-flight promise.
-// Concurrent bootstraps with DIFFERENT names race independently — each creates
-// its own dedicated browser window, there is no shared "host window" to serialize.
-const groupCreationLocks = new Map();
-// Init promise, awaited in handleToolRequest before processing any tool
-let stateLoaded = null;
-
-async function persistGroupsState() {
-  try {
-    const out = {};
-    for (const [name, meta] of groupsByName) {
-      out[name] = { id: meta.id, color: meta.color };
-    }
-    await chrome.storage.local.set({ groups: out });
-  } catch {}
-}
-
-async function loadGroupsState() {
-  try {
-    const stored = await chrome.storage.local.get(["groups"]);
-    const persisted = stored.groups || {};
-    for (const [name, meta] of Object.entries(persisted)) {
-      try {
-        const group = await chrome.tabGroups.get(meta.id);
-        if (group && group.title === name) {
-          const tabs = await chrome.tabs.query({ groupId: group.id });
-          groupsByName.set(name, {
-            id: group.id,
-            color: VALID_GROUP_COLORS.includes(meta.color) ? meta.color : DEFAULT_GROUP_COLOR,
-            tabIds: new Set(tabs.map((t) => t.id)),
-          });
-        }
-      } catch {
-        // Group is gone since last persist; drop it silently
-      }
-    }
-    // Persist back any cleanup
-    await persistGroupsState();
-  } catch {}
-}
-
-function validateGroupName(name) {
-  if (typeof name !== "string") throw new Error("groupName must be a string");
-  const trimmed = name.trim();
-  if (!trimmed) throw new Error("groupName must be non-empty");
-  if (trimmed.length > 50) throw new Error("groupName must be 50 characters or fewer");
-  return trimmed;
-}
-
-function validateColor(color) {
-  if (color === undefined || color === null || color === "") return null;
-  if (typeof color !== "string" || !VALID_GROUP_COLORS.includes(color)) {
-    throw new Error(`color must be one of: ${VALID_GROUP_COLORS.join(", ")}`);
-  }
-  return color;
-}
-
 // --- State ---
 let nativePort = null;
+let tabGroupId = null;
+let tabGroupTabs = new Set();
 const attachedTabs = new Map(); // tabId -> { enabledDomains: Set }
 const consoleMessages = new Map(); // tabId -> [{level, text, timestamp, url}]
 const networkRequests = new Map(); // tabId -> [{url, method, status, type, timestamp}]
 const screenshotStore = new Map(); // imageId -> base64
 
+let heartbeatTimer = null;
+
+// switch_browser releases this browser's hold on the shared runtime by
+// dropping the native port; this window keeps us from immediately re-grabbing
+// it so a target browser (extension enabled) can become primary.
+let suspendReconnectUntil = 0;
+const SWITCH_RELEASE_MS = 15000;
+
+async function detectBrowser() {
+  try {
+    if (navigator.brave && (await navigator.brave.isBrave?.())) return "Brave";
+  } catch (e) {}
+  const ua = navigator.userAgent || "";
+  if (/Edg\//.test(ua)) return "Edge";
+  const brands = (navigator.userAgentData?.brands || []).map((b) => b.brand).join(" ");
+  if (/Brave/i.test(brands)) return "Brave";
+  if (/OPR\//.test(ua)) return "Opera";
+  return "Chrome";
+}
+
 // --- Keep-alive alarm ---
+// Backstop wake-up for the MV3 service worker. The proactive heartbeat
+// inside connectNativeHost (~15s) is the primary mechanism; this alarm
+// covers cases where the SW is fully evicted between heartbeats.
 chrome.alarms.create("keepalive", { periodInMinutes: 0.4 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "keepalive") {
@@ -91,24 +51,72 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 // --- Native messaging ---
 function connectNativeHost() {
   if (nativePort) return;
+  // Honor a switch_browser release window: stay disconnected so another
+  // browser can take the primary connection, then resume.
+  if (Date.now() < suspendReconnectUntil) {
+    setTimeout(connectNativeHost, 500);
+    return;
+  }
   try {
     nativePort = chrome.runtime.connectNative(NATIVE_HOST_NAME);
 
     nativePort.onMessage.addListener((msg) => {
+      // Heartbeat acks (and any other non-request server-originated messages)
+      // are intentionally ignored here — only tool_request kicks work.
       if (msg.type === "tool_request" && msg.id) {
         handleToolRequest(msg.id, msg.tool, msg.args || {});
+      } else if (msg.type === "recording_saved") {
+        // Reply from the native host after writing a recording bundle to disk.
+        const resolve = recorder.pendingSaves.get(String(msg.recording_id));
+        if (resolve) {
+          recorder.pendingSaves.delete(String(msg.recording_id));
+          resolve(msg.ok ? msg.path : null);
+        }
       }
     });
 
     nativePort.onDisconnect.addListener(() => {
       const err = chrome.runtime.lastError;
       nativePort = null;
-      // Retry in 2 seconds
-      setTimeout(connectNativeHost, 2000);
+      stopHeartbeat();
+      // Retry quickly. Reconnect latency dominates per-call wall-clock when
+      // the SW just slept; 250ms is the right floor — fast enough to be
+      // invisible to a single tool call, slow enough not to busy-spin on a
+      // genuinely dead host (which will be retried again on next alarm).
+      setTimeout(connectNativeHost, 250);
     });
+
+    startHeartbeat();
   } catch (e) {
     nativePort = null;
-    setTimeout(connectNativeHost, 2000);
+    stopHeartbeat();
+    setTimeout(connectNativeHost, 250);
+  }
+}
+
+// Proactive heartbeat: send a small message every ~15s while the native
+// port is alive. Two effects:
+//   1) The SW stays alive between alarm fires (postMessage resets the
+//      ~30s idle timer Chrome uses to evict MV3 service workers).
+//   2) The native-host TCP socket stays warm — no chance of Chrome
+//      garbage-collecting the connection because it's been idle.
+// 15s is well under both Chrome's SW idle timeout and the alarm period.
+function startHeartbeat() {
+  stopHeartbeat();
+  heartbeatTimer = setInterval(() => {
+    if (!nativePort) return;
+    try {
+      nativePort.postMessage({ type: "heartbeat", t: Date.now() });
+    } catch {
+      // Port disconnected; the onDisconnect handler will reconnect.
+    }
+  }, 15000);
+}
+
+function stopHeartbeat() {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
   }
 }
 
@@ -130,157 +138,99 @@ function sendError(id, error) {
   }
 }
 
-// --- Multi-group management ---
-
-// Verify a tracked group still exists in chrome. If not, drop from state.
-async function refreshGroupMeta(name) {
-  const meta = groupsByName.get(name);
-  if (!meta) return null;
-  try {
-    await chrome.tabGroups.get(meta.id);
-    const tabs = await chrome.tabs.query({ groupId: meta.id });
-    meta.tabIds = new Set(tabs.map((t) => t.id));
-    return meta;
-  } catch {
-    groupsByName.delete(name);
-    await persistGroupsState();
-    return null;
-  }
-}
-
-// Idempotent: returns existing group meta if present, otherwise creates a new
-// window+tab+group with the given name and color. Race-safe via per-name lock.
-async function ensureNamedGroup(name, color) {
-  const trimmed = validateGroupName(name);
-  const validatedColor = validateColor(color);
-
-  const existing = await refreshGroupMeta(trimmed);
-  if (existing) {
-    if (validatedColor && validatedColor !== existing.color) {
-      try {
-        await chrome.tabGroups.update(existing.id, { color: validatedColor });
-        existing.color = validatedColor;
-        await persistGroupsState();
-      } catch {}
-    }
-    return existing;
-  }
-
-  if (groupCreationLocks.has(trimmed)) return groupCreationLocks.get(trimmed);
-
-  const promise = (async () => {
-    // One group = one window. Each bootstrap spawns its own dedicated Chrome
-    // window so agents working in parallel have visually distinct browsers
-    // (e.g. spread across monitors or treated as independent processes by
-    // the user). Concurrent bootstraps with different groupNames each create
-    // their own window independently — no shared state, no mutex needed.
-    const finalColor = validatedColor || DEFAULT_GROUP_COLOR;
-    const win = await chrome.windows.create({ focused: true, url: "about:blank" });
-    const tab = win.tabs[0];
-
-    const groupId = await chrome.tabs.group({ tabIds: [tab.id] });
-    await chrome.tabGroups.update(groupId, { title: trimmed, color: finalColor });
-    const meta = { id: groupId, color: finalColor, tabIds: new Set([tab.id]) };
-    groupsByName.set(trimmed, meta);
-    await persistGroupsState();
-    return meta;
-  })();
-
-  groupCreationLocks.set(trimmed, promise);
-  try {
-    return await promise;
-  } finally {
-    groupCreationLocks.delete(trimmed);
-  }
-}
-
-// Find which (if any) of our named groups owns a given tabId.
-async function findGroupForTab(tabId) {
-  // Quick path: scan in-memory state
-  for (const [name, meta] of groupsByName) {
-    if (meta.tabIds.has(tabId)) return { name, meta };
-  }
-  // Slow path: maybe service worker lost in-memory tabIds. Resolve via chrome.
-  try {
-    const tab = await chrome.tabs.get(tabId);
-    if (tab.groupId === -1) return null;
-    for (const [name, meta] of groupsByName) {
-      if (meta.id === tab.groupId) {
-        meta.tabIds.add(tabId);
-        return { name, meta };
+// --- Tab group management ---
+async function ensureTabGroup(createIfEmpty) {
+  // Check if our tab group still exists
+  if (tabGroupId !== null) {
+    try {
+      const group = await chrome.tabGroups.get(tabGroupId);
+      if (group) {
+        // Verify tabs are still in the group
+        const tabs = await chrome.tabs.query({ groupId: tabGroupId });
+        tabGroupTabs = new Set(tabs.map((t) => t.id));
+        if (tabGroupTabs.size > 0) return;
       }
+    } catch {
+      tabGroupId = null;
+      tabGroupTabs.clear();
     }
-    // Maybe a brand new group whose title matches one we persisted but didn't reload yet
-    const group = await chrome.tabGroups.get(tab.groupId);
-    if (group && groupsByName.has(group.title)) {
-      const meta = groupsByName.get(group.title);
-      meta.id = group.id;
-      meta.tabIds.add(tabId);
-      return { name: group.title, meta };
-    }
-  } catch {}
-  return null;
+  }
+
+  if (!createIfEmpty) return;
+
+  // Create a new window with a tab, group it
+  const win = await chrome.windows.create({ focused: true, url: "about:blank" });
+  const tab = win.tabs[0];
+  const groupId = await chrome.tabs.group({ tabIds: [tab.id] });
+  await chrome.tabGroups.update(groupId, { title: "MCP", color: "blue" });
+  tabGroupId = groupId;
+  tabGroupTabs = new Set([tab.id]);
 }
 
-async function isInOurGroup(tabId) {
-  return (await findGroupForTab(tabId)) !== null;
-}
-
-function tabSummary(tabs) {
-  return tabs.map((t) => ({
+function formatTabContext(tabs) {
+  const available = tabs.map((t) => ({
     tabId: t.id,
     title: t.title || "Untitled",
     url: t.url || "",
   }));
-}
 
-function formatSingleGroupContext(name, meta, tabs) {
-  const available = tabSummary(tabs);
-  let text = `Tab Context (group "${name}"):\n- Available tabs:\n`;
+  let text = `Tab Context:\n- Available tabs:\n`;
   for (const t of available) {
     text += `  \u2022 tabId ${t.tabId}: "${t.title}" (${t.url})\n`;
   }
+
   return {
     content: [
       {
         type: "text",
-        text:
-          JSON.stringify({
-            groupName: name,
-            tabGroupId: meta.id,
-            color: meta.color,
-            availableTabs: available,
-          }) +
-          "\n\n" +
-          text,
+        text: JSON.stringify({ availableTabs: available, tabGroupId }) + "\n\n" + text,
       },
     ],
   };
 }
 
-async function formatAllGroupsContext() {
-  const groups = {};
-  let text = `Tab Context (all MCP-managed groups):\n`;
-  if (groupsByName.size === 0) {
-    text += `- No groups exist yet. Call tabs_context_mcp({ groupName: "<your-name>", createIfEmpty: true }) to create one.\n`;
-  }
-  for (const [name, meta] of groupsByName) {
-    const tabs = await chrome.tabs.query({ groupId: meta.id });
-    const available = tabSummary(tabs);
-    groups[name] = { tabGroupId: meta.id, color: meta.color, tabs: available };
-    text += `\n[${name}] color=${meta.color} tabGroupId=${meta.id}\n`;
-    for (const t of available) {
-      text += `  \u2022 tabId ${t.tabId}: "${t.title}" (${t.url})\n`;
+async function isInGroup(tabId) {
+  // Always check live state — in-memory tabGroupTabs can be stale after service worker restart
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.groupId !== -1) {
+      // Recover tabGroupId if we lost it (service worker restart)
+      if (tabGroupId === null) {
+        try {
+          const group = await chrome.tabGroups.get(tab.groupId);
+          if (group.title === "MCP") {
+            tabGroupId = group.id;
+            const groupTabs = await chrome.tabs.query({ groupId: tabGroupId });
+            tabGroupTabs = new Set(groupTabs.map((t) => t.id));
+          }
+        } catch {}
+      }
+      return tab.groupId === tabGroupId;
     }
+    return tabGroupTabs.has(tabId);
+  } catch {
+    return false;
   }
-  return {
-    content: [
-      { type: "text", text: JSON.stringify({ groups }) + "\n\n" + text },
-    ],
-  };
 }
 
 // --- CDP helpers ---
+// Chrome (and Chromium generally) throttle a non-visible tab: its compositor
+// stops committing frames, so Input.dispatchMouseEvent to it stalls ~5s. We
+// make a tab the active/selected tab of its window ONLY when it is created —
+// that is the moment the tab we are about to drive must be foreground. We do
+// NOT re-activate on every action, and we NEVER focus/raise the window (that
+// would steal OS focus, which is disruptive when the browser is shared). If a
+// tab is later backgrounded (e.g. the user selects another tab), its input
+// pays the throttle cost until it is foreground again — an accepted tradeoff.
+async function activateTab(tabId) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (!tab.active) await chrome.tabs.update(tabId, { active: true });
+  } catch (e) {
+    console.warn("activateTab:", e.message);
+  }
+}
+
 async function ensureAttached(tabId) {
   if (attachedTabs.has(tabId)) return;
   await chrome.debugger.attach({ tabId }, "1.3");
@@ -305,25 +255,31 @@ async function ensureDomain(tabId, domain) {
   state.enabledDomains.add(domain);
 }
 
+// A single CDP command must never hang a tool call to the 60s MCP timeout.
+// On a heavy page mid-reflow, Page.captureScreenshot (and other commands) can
+// block indefinitely; bound every command so a stuck one fails fast and
+// surfaces as a tool error the agent can react to, instead of a silent stall.
+const CDP_TIMEOUT_MS = 20000;
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 async function cdp(tabId, method, params = {}) {
   await ensureAttached(tabId);
-  return chrome.debugger.sendCommand({ tabId }, method, params);
+  return withTimeout(
+    chrome.debugger.sendCommand({ tabId }, method, params),
+    CDP_TIMEOUT_MS,
+    `CDP ${method}`
+  );
 }
 
 // Clean up when tab is closed
-chrome.tabs.onRemoved.addListener(async (tabId) => {
-  let mutated = false;
-  for (const [name, meta] of groupsByName) {
-    if (meta.tabIds.delete(tabId)) {
-      mutated = true;
-      if (meta.tabIds.size === 0) {
-        // Chrome auto-removes the group when its last tab closes; drop our state too
-        groupsByName.delete(name);
-      }
-      break;
-    }
-  }
-  if (mutated) await persistGroupsState();
+chrome.tabs.onRemoved.addListener((tabId) => {
+  tabGroupTabs.delete(tabId);
   if (attachedTabs.has(tabId)) {
     try { chrome.debugger.detach({ tabId }); } catch {}
     attachedTabs.delete(tabId);
@@ -500,8 +456,43 @@ async function takeScreenshot(tabId) {
 }
 
 // --- Mouse helpers ---
+// Brave withholds the debugger ack for synthesized mouse events (a constant
+// ~5s flush for move/press/release; mouseWheel is never acked at all) while
+// applying the event itself immediately. Chrome acks instantly. The ack
+// carries no data we need, so give real protocol errors a short grace window
+// and then proceed; a late ack (or late failure) is logged, not awaited.
+// Brave's debugger input pipeline (verified empirically, 2026-07-15):
+// the FIRST Input.dispatchMouseEvent of a burst acks after a constant ~5s
+// cold-start; commands issued while an earlier one is still un-acked are
+// NOT queued for press/release types, they are silently DROPPED (mouseMoved
+// queues and applies late; mousePressed/Released vanish). mouseWheel is
+// never acked at all but its scroll effect applies immediately.
+// Consequences: move/press/release MUST be dispatched serially with each
+// ack awaited (correctness over speed); ONLY mouseWheel may use a bounded
+// race, because its effect is verified to apply without the ack and nothing
+// depends on it inside the same action. Chrome acks everything instantly,
+// so the awaits cost nothing there.
+const INPUT_ACK_WAIT_MS = 250;
+
+async function sendMouseEvent(tabId, params, { awaitAck = true } = {}) {
+  await ensureAttached(tabId);
+  const send = withTimeout(
+    chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", params),
+    CDP_TIMEOUT_MS,
+    "CDP Input.dispatchMouseEvent",
+  );
+  if (awaitAck) {
+    await send;
+    return;
+  }
+  await Promise.race([
+    send.catch((e) => console.warn("Input.dispatchMouseEvent late ack/failure:", e.message)),
+    sleep(INPUT_ACK_WAIT_MS),
+  ]);
+}
+
 async function dispatchMouse(tabId, type, x, y, opts = {}) {
-  await cdp(tabId, "Input.dispatchMouseEvent", {
+  await sendMouseEvent(tabId, {
     type,
     x,
     y,
@@ -530,140 +521,114 @@ function sleep(ms) {
 // --- Tool handlers ---
 const toolHandlers = {
   async tabs_context_mcp(args) {
-    const { groupName, createIfEmpty, color } = args || {};
-
-    // No groupName: return ALL groups owned by this extension instance.
-    if (groupName === undefined || groupName === null || groupName === "") {
-      return formatAllGroupsContext();
+    await ensureTabGroup(args.createIfEmpty);
+    if (tabGroupId === null) {
+      return {
+        content: [{ type: "text", text: "No MCP tab group exists. Use createIfEmpty: true to create one." }],
+      };
     }
+    const tabs = await chrome.tabs.query({ groupId: tabGroupId });
+    return formatTabContext(tabs);
+  },
 
-    const trimmed = validateGroupName(groupName);
+  async tabs_create_mcp(args) {
+    await ensureTabGroup(true);
+    const tab = await chrome.tabs.create({ active: true });
+    await chrome.tabs.group({ tabIds: [tab.id], groupId: tabGroupId });
+    tabGroupTabs.add(tab.id);
+    // Foreground the freshly created tab (grouping can drop it into another
+    // window). This is the ONLY place we activate a tab — no per-action
+    // re-activation, no window focus-stealing.
+    await activateTab(tab.id);
+    const tabs = await chrome.tabs.query({ groupId: tabGroupId });
+    const result = formatTabContext(tabs);
+    result.content[0].text = `Created new tab. Tab ID: ${tab.id}\n\n` + result.content[0].text;
+    return result;
+  },
 
-    // Group exists already
-    const existing = await refreshGroupMeta(trimmed);
-    if (existing) {
-      const tabs = await chrome.tabs.query({ groupId: existing.id });
-      return formatSingleGroupContext(trimmed, existing, tabs);
-    }
-
-    // Doesn't exist
-    if (!createIfEmpty) {
+  async tabs_close_mcp(args) {
+    // Accept either a single tabId (most common) or a tabIds array for
+    // batch close. Validate every id is actually in the current MCP group
+    // so we never close the user's other tabs.
+    const requested = Array.isArray(args?.tabIds)
+      ? args.tabIds
+      : args?.tabId !== undefined
+        ? [args.tabId]
+        : [];
+    if (requested.length === 0) {
       return {
         content: [
           {
             type: "text",
-            text: `No MCP tab group named "${trimmed}" exists. Pass createIfEmpty: true to create it.`,
-          },
-        ],
+            text: "No tabId provided. Pass `tabId: <number>` or `tabIds: [<number>, ...]`."
+          }
+        ]
       };
     }
-
-    const meta = await ensureNamedGroup(trimmed, color);
-    const tabs = await chrome.tabs.query({ groupId: meta.id });
-    return formatSingleGroupContext(trimmed, meta, tabs);
-  },
-
-  async tabs_create_mcp(args) {
-    const { groupName, color } = args || {};
-    if (groupName === undefined || groupName === null || groupName === "") {
-      throw new Error('groupName is required. Call tabs_context_mcp({ groupName, createIfEmpty: true }) first to establish your group.');
+    const inGroup = [];
+    const skipped = [];
+    for (const id of requested) {
+      const idNum = typeof id === "string" ? Number(id) : id;
+      if (await isInGroup(idNum)) inGroup.push(idNum);
+      else skipped.push(idNum);
     }
-    const trimmed = validateGroupName(groupName);
-
-    // ensureNamedGroup is idempotent — creates the group if missing, returns existing meta otherwise.
-    const meta = await ensureNamedGroup(trimmed, color);
-
-    const tab = await chrome.tabs.create({ active: true, windowId: (await chrome.tabGroups.get(meta.id)).windowId });
-    await chrome.tabs.group({ tabIds: [tab.id], groupId: meta.id });
-    meta.tabIds.add(tab.id);
-    await persistGroupsState();
-
-    const tabs = await chrome.tabs.query({ groupId: meta.id });
-    const result = formatSingleGroupContext(trimmed, meta, tabs);
-    result.content[0].text = `Created new tab in group "${trimmed}". Tab ID: ${tab.id}\n\n` + result.content[0].text;
-    return result;
-  },
-
-  async close_tabs(args) {
-    const { groupName, tabIds } = args || {};
-    const hasGroup = typeof groupName === "string" && groupName.trim() !== "";
-    const hasTabs = Array.isArray(tabIds) && tabIds.length > 0;
-
-    if (hasGroup === hasTabs) {
-      throw new Error("Provide exactly one of { groupName } or { tabIds: [...] }.");
+    if (inGroup.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `None of the requested tabs are in the MCP group. Requested: [${requested.join(", ")}]. Use tabs_context_mcp to see what is in the group.`
+          }
+        ]
+      };
     }
-
-    async function closeOne(id) {
+    // chrome.tabs.remove force-closes — no beforeunload prompt. Detach any
+    // CDP debuggers proactively so the onRemoved handler doesn't race.
+    for (const id of inGroup) {
       if (attachedTabs.has(id)) {
         try { await chrome.debugger.detach({ tabId: id }); } catch {}
         attachedTabs.delete(id);
       }
-      try { await chrome.tabs.remove(id); return true; } catch { return false; }
     }
+    await chrome.tabs.remove(inGroup);
+    for (const id of inGroup) tabGroupTabs.delete(id);
 
-    if (hasGroup) {
-      const trimmed = validateGroupName(groupName);
-      const meta = await refreshGroupMeta(trimmed);
-      if (!meta) {
-        return {
-          content: [{ type: "text", text: `No MCP-managed group named "${trimmed}" exists. Nothing to close.` }],
-        };
+    // Closing the last tab in the group also closes the window; the group
+    // becomes invalid. Reflect that in the response so the model doesn't
+    // try to reuse stale tabIds.
+    let tabs = [];
+    try {
+      if (tabGroupId !== null) {
+        tabs = await chrome.tabs.query({ groupId: tabGroupId });
       }
-      const ids = Array.from(meta.tabIds);
-      let closedCount = 0;
-      for (const id of ids) {
-        if (await closeOne(id)) closedCount++;
-      }
-      // Proactively remove from state. The chrome.tabs.onRemoved listener
-      // will also fire for each tab and do the same cleanup — it's idempotent.
-      groupsByName.delete(trimmed);
-      await persistGroupsState();
+    } catch {}
+    if (tabs.length === 0) {
+      tabGroupId = null;
+      tabGroupTabs.clear();
       return {
-        content: [{
-          type: "text",
-          text: `Closed ${closedCount}/${ids.length} tab(s) in group "${trimmed}". Chrome will auto-remove the window since the last tab in the group is gone. Group removed from persisted state.`,
-        }],
+        content: [
+          {
+            type: "text",
+            text:
+              `Closed ${inGroup.length} tab(s): [${inGroup.join(", ")}]` +
+              (skipped.length ? `. Skipped (not in group): [${skipped.join(", ")}]` : "") +
+              `. The MCP tab group is now empty — the window has been closed. Use tabs_context_mcp({ createIfEmpty: true }) to start a new group.`
+          }
+        ]
       };
     }
-
-    // hasTabs path
-    const rejected = [];
-    const accepted = [];
-    for (const id of tabIds) {
-      if (typeof id !== "number" || !Number.isFinite(id)) {
-        rejected.push({ id, reason: "not a number" });
-        continue;
-      }
-      const ownedBy = await findGroupForTab(id);
-      if (!ownedBy) {
-        rejected.push({ id, reason: "not in any MCP-managed group" });
-      } else {
-        accepted.push({ id, name: ownedBy.name });
-      }
-    }
-
-    if (rejected.length > 0) {
-      throw new Error(
-        `Refusing to close tabs that aren't in an MCP-managed group: ${rejected.map((r) => `${r.id} (${r.reason})`).join(", ")}`
-      );
-    }
-
-    let closedCount = 0;
-    for (const { id } of accepted) {
-      if (await closeOne(id)) closedCount++;
-    }
-    // onRemoved listener will clean up groupsByName entries per tab.
-    return {
-      content: [{
-        type: "text",
-        text: `Closed ${closedCount}/${accepted.length} tab(s). Groups that become empty are auto-removed from state by the onRemoved listener.`,
-      }],
-    };
+    const result = formatTabContext(tabs);
+    result.content[0].text =
+      `Closed ${inGroup.length} tab(s): [${inGroup.join(", ")}]` +
+      (skipped.length ? `. Skipped (not in group): [${skipped.join(", ")}]` : "") +
+      `.\n\n` +
+      result.content[0].text;
+    return result;
   },
 
   async navigate(args) {
     const { url, tabId } = args;
-    if (!(await isInOurGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in any MCP-managed tab group.` }] };
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
 
     if (url === "back") {
       await chrome.tabs.goBack(tabId);
@@ -703,9 +668,7 @@ const toolHandlers = {
     });
 
     const tab = await chrome.tabs.get(tabId);
-    const tabs = tab.groupId !== -1
-      ? await chrome.tabs.query({ groupId: tab.groupId })
-      : [tab];
+    const tabs = await chrome.tabs.query({ groupId: tabGroupId });
     const loading = tab.status !== "complete" ? " (still loading)" : "";
     const text = `Navigated to ${tab.url}${loading}.\n## Pages\n` +
       tabs.map((t, i) => `${i + 1}: ${t.url}${t.id === tabId ? " [selected]" : ""}`).join("\n");
@@ -715,7 +678,7 @@ const toolHandlers = {
 
   async computer(args) {
     const { action, tabId } = args;
-    if (!(await isInOurGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in any MCP-managed tab group.` }] };
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
 
     let coordinate = args.coordinate;
     // Resolve ref to coordinates if provided
@@ -750,6 +713,29 @@ const toolHandlers = {
         if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for left_click" }] };
         await mouseClick(tabId, coordinate[0], coordinate[1], { modifiers });
         return { content: [{ type: "text", text: `Clicked at (${coordinate[0]}, ${coordinate[1]})` }] };
+      }
+
+      // Hidden diagnostic (not in the tool schema): serially times every CDP
+      // input variant at the given coordinate so we can hunt for a dispatch
+      // path Brave acks fast (keyboard-style) instead of the ~5s mouse path.
+      case "diag_input": {
+        const dx = coordinate ? coordinate[0] : 200;
+        const dy = coordinate ? coordinate[1] : 200;
+        const r = {};
+        const t = async (label, fn) => {
+          const t0 = Date.now();
+          try { await fn(); r[label] = (Date.now() - t0) / 1000; }
+          catch (e) { r[label] = (Date.now() - t0) / 1000; r[label + "_err"] = String(e.message || e).slice(0, 80); }
+        };
+        await t("mouse_moved", () => cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: dx, y: dy }));
+        await t("mouse_pressed", () => cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x: dx, y: dy, button: "left", clickCount: 1 }));
+        await t("mouse_released", () => cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x: dx, y: dy, button: "left", clickCount: 1 }));
+        await t("touch_start", () => cdp(tabId, "Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x: dx, y: dy }] }));
+        await t("touch_end", () => cdp(tabId, "Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] }));
+        await t("synthesize_tap", () => cdp(tabId, "Input.synthesizeTapGesture", { x: dx, y: dy }));
+        await t("synthesize_scroll", () => cdp(tabId, "Input.synthesizeScrollGesture", { x: dx, y: dy, yDistance: -100 }));
+        await t("insert_text_noop", () => cdp(tabId, "Input.insertText", { text: "" }));
+        return { content: [{ type: "text", text: JSON.stringify(r) }] };
       }
 
       case "right_click": {
@@ -823,22 +809,29 @@ const toolHandlers = {
         const amount = Math.min(args.scroll_amount || 3, 10);
         const deltaX = dir === "left" ? -amount * 100 : dir === "right" ? amount * 100 : 0;
         const deltaY = dir === "up" ? -amount * 100 : dir === "down" ? amount * 100 : 0;
-        await cdp(tabId, "Input.dispatchMouseEvent", {
+        await sendMouseEvent(tabId, {
           type: "mouseWheel",
           x: coordinate[0],
           y: coordinate[1],
           deltaX,
           deltaY,
           modifiers,
-        });
+        }, { awaitAck: false });
         await sleep(300);
-        const { base64 } = await takeScreenshot(tabId);
-        return {
-          content: [
-            { type: "text", text: `Scrolled ${dir} by ${amount} ticks at (${coordinate[0]}, ${coordinate[1]})` },
-            { type: "image", data: base64, mimeType: "image/jpeg" },
-          ],
-        };
+        // The scroll already happened; the confirmation screenshot is best-effort.
+        // On a heavy page still re-rendering after the scroll, the capture can
+        // block, so bound it and degrade to a text-only result rather than
+        // stalling the whole scroll (and the agent's retries) to the 60s cap.
+        const scrollContent = [
+          { type: "text", text: `Scrolled ${dir} by ${amount} ticks at (${coordinate[0]}, ${coordinate[1]})` },
+        ];
+        try {
+          const { base64 } = await withTimeout(takeScreenshot(tabId), 6000, "scroll screenshot");
+          scrollContent.push({ type: "image", data: base64, mimeType: "image/jpeg" });
+        } catch (e) {
+          scrollContent[0].text += ` (post-scroll screenshot unavailable: ${e.message}; take a screenshot to see the result)`;
+        }
+        return { content: scrollContent };
       }
 
       case "scroll_to": {
@@ -909,7 +902,7 @@ const toolHandlers = {
 
   async read_page(args) {
     const { tabId } = args;
-    if (!(await isInOurGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in any MCP-managed tab group.` }] };
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
 
     const resp = await sendContentMessage(tabId, {
       type: "generateAccessibilityTree",
@@ -935,7 +928,7 @@ const toolHandlers = {
 
   async get_page_text(args) {
     const { tabId } = args;
-    if (!(await isInOurGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in any MCP-managed tab group.` }] };
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
 
     const resp = await sendContentMessage(tabId, { type: "getPageText" });
     if (!resp?.result) return { content: [{ type: "text", text: "Error: Could not extract page text" }] };
@@ -957,7 +950,7 @@ const toolHandlers = {
 
   async find(args) {
     const { query, tabId } = args;
-    if (!(await isInOurGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in any MCP-managed tab group.` }] };
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
 
     const resp = await sendContentMessage(tabId, { type: "findElements", query });
     const results = resp?.result || [];
@@ -976,7 +969,7 @@ const toolHandlers = {
 
   async form_input(args) {
     const { ref, value, tabId } = args;
-    if (!(await isInOurGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in any MCP-managed tab group.` }] };
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
 
     const resp = await sendContentMessage(tabId, { type: "setFormValue", ref, value });
     const result = resp?.result;
@@ -987,7 +980,7 @@ const toolHandlers = {
 
   async javascript_tool(args) {
     const { text, tabId } = args;
-    if (!(await isInOurGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in any MCP-managed tab group.` }] };
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
 
     await ensureAttached(tabId);
     try {
@@ -1015,7 +1008,7 @@ const toolHandlers = {
 
   async read_console_messages(args) {
     const { tabId, pattern, limit = 100, onlyErrors, clear } = args;
-    if (!(await isInOurGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in any MCP-managed tab group.` }] };
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
 
     // Ensure console domain is enabled
     await ensureAttached(tabId);
@@ -1057,7 +1050,7 @@ const toolHandlers = {
 
   async read_network_requests(args) {
     const { tabId, urlPattern, limit = 100, clear } = args;
-    if (!(await isInOurGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in any MCP-managed tab group.` }] };
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
 
     // Ensure network domain is enabled
     await ensureAttached(tabId);
@@ -1088,16 +1081,31 @@ const toolHandlers = {
 
   async resize_window(args) {
     const { width, height, tabId } = args;
-    if (!(await isInOurGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in any MCP-managed tab group.` }] };
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
 
+    await ensureAttached(tabId);
     const tab = await chrome.tabs.get(tabId);
+    // A maximized/fullscreen window silently ignores width/height (notably on
+    // macOS), so normalize the state first, then size it.
+    try { await chrome.windows.update(tab.windowId, { state: "normal" }); } catch (e) {}
     await chrome.windows.update(tab.windowId, { width, height });
+    // The page's layout viewport and every screenshot are pinned by the CDP
+    // device-metrics override (set at attach to dpr=1 at the old size). Without
+    // repointing it, the OS window moves but window.innerWidth, the rendered
+    // viewport, and captures never change — which is why resize looked like a
+    // no-op. Re-apply the override at the requested size.
+    await cdp(tabId, "Emulation.setDeviceMetricsOverride", {
+      width,
+      height,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
     return { content: [{ type: "text", text: `Resized window to ${width}x${height}` }] };
   },
 
   async upload_image(args) {
     const { imageId, tabId, ref, coordinate, filename = "image.png" } = args;
-    if (!(await isInOurGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in any MCP-managed tab group.` }] };
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
 
     const base64 = screenshotStore.get(imageId);
     if (!base64) {
@@ -1149,7 +1157,30 @@ const toolHandlers = {
   },
 
   async switch_browser(args) {
-    return { content: [{ type: "text", text: "Browser switching is not yet supported. The extension connects to whichever browser has it loaded (Chrome, Brave, or Edge). To switch, disable the extension in the current browser, enable it in the target browser, and restart both." }] };
+    const current = await detectBrowser();
+    // Release AFTER this reply is delivered — it goes out over the very native
+    // port we are about to drop. Suspending reconnect lets a target browser
+    // whose extension is enabled bind the shared runtime and become primary;
+    // if none takes over, this browser reconnects when the window elapses.
+    setTimeout(() => {
+      suspendReconnectUntil = Date.now() + SWITCH_RELEASE_MS;
+      if (nativePort) {
+        try { nativePort.disconnect(); } catch (e) {}
+        nativePort = null;
+        stopHeartbeat();
+      }
+    }, 300);
+    return {
+      content: [{
+        type: "text",
+        text:
+          `Releasing the connection from ${current}. Enable this extension in the ` +
+          `target browser (no restart needed) — for the next ~${SWITCH_RELEASE_MS / 1000}s it can take over ` +
+          `the shared runtime automatically. Only one browser drives automation at a ` +
+          `time. If nothing takes over, ${current} reconnects when the window elapses. ` +
+          `Re-run tabs_context_mcp after a few seconds to confirm the active browser.`,
+      }],
+    };
   },
 
   async update_plan(args) {
@@ -1161,47 +1192,19 @@ const toolHandlers = {
     text += "\nPlan auto-approved (no permission restrictions in this extension).";
     return { content: [{ type: "text", text }] };
   },
-
-  async healthcheck() {
-    // Reports extension-side state. The mcp-server's healthcheck tool composes
-    // this with its own local state (TCP bind, native-host connection, etc.)
-    // and returns the merged result to the caller.
-    let manifest = {};
-    try { manifest = chrome.runtime.getManifest(); } catch {}
-
-    const groups = {};
-    for (const [name, meta] of groupsByName) {
-      groups[name] = {
-        tabGroupId: meta.id,
-        color: meta.color,
-        tabCount: meta.tabIds.size,
-      };
-    }
-
-    const data = {
-      extensionName: manifest.name || "unknown",
-      extensionVersion: manifest.version || "unknown",
-      manifestVersion: manifest.manifest_version || null,
-      nativePortConnected: nativePort !== null,
-      groupsCount: groupsByName.size,
-      groups,
-      attachedTabsCount: attachedTabs.size,
-      consoleBuffersCount: consoleMessages.size,
-      networkBuffersCount: networkRequests.size,
-      screenshotStoreSize: screenshotStore.size,
-      timestamp: new Date().toISOString(),
-    };
-
-    return { content: [{ type: "text", text: JSON.stringify(data) }] };
-  },
 };
 
 // --- Tool dispatch ---
 async function handleToolRequest(id, tool, args) {
-  // Block until persisted multi-group state is loaded so handlers see the right Map.
-  if (stateLoaded) {
-    try { await stateLoaded; } catch {}
+  // recording_ack arrives from the MCP server when Claude confirms receipt of
+  // a recording_complete event. Mark it delivered so stopRecording() can
+  // report the "delivered to Claude Code" state (§4).
+  if (tool === "recording_ack") {
+    if (args && args.recording_id) recorder.deliveredIds.add(String(args.recording_id));
+    sendResponse(id, { content: [{ type: "text", text: "ack received" }] });
+    return;
   }
+
   const handler = toolHandlers[tool];
   if (!handler) {
     sendError(id, `Unknown tool: ${tool}`);
@@ -1216,7 +1219,575 @@ async function handleToolRequest(id, tool, args) {
   }
 }
 
+// ===========================================================================
+// Imitation-learning recorder (NEEDS LIVE TESTING)
+// ---------------------------------------------------------------------------
+// The service worker is a THIN ROUTER only: it toggles recording on the icon,
+// owns the offscreen document (the durable buffer that survives SW eviction),
+// forwards behavior events from content scripts to it, segments the cross-tab
+// timeline, and on stop ships the bundle to disk + notifies Claude Code.
+// The heavy state lives in the offscreen doc, never in SW globals.
+// ===========================================================================
+const recorder = {
+  active: false,
+  recordingId: null,
+  startedAt: null,
+  deliveredIds: new Set(), // recording_ids Claude has acked
+  pendingSaves: new Map(), // recording_id -> resolve (native-host disk write)
+  imgSeq: 0, // frame counter for the images/ dir
+  lastCapture: 0, // ts of last frame, to throttle to ≤1/sec
+  lastVw: 0, // last viewport size seen (from content-script events), stamped
+  lastVh: 0, // onto each frame so the viewer can map cursor x/y onto it
+  // True while booting the mic or processing a stop (transcribe/save/copy).
+  // Icon clicks are IGNORED while busy. In-memory on purpose: a dead SW has
+  // no in-flight pipeline, so busy must never survive a restart.
+  busy: false,
+  // Badge epoch: bumped on every start/stop transition. Every DELAYED badge
+  // writer (the post-copy delivery update, the 4s result-clear timer) captures
+  // the epoch and is discarded if a newer transition happened — a previous
+  // recording's stragglers must never repaint the current recording's badge.
+  epoch: 0
+};
+
+// MV3 evicts this service worker after ~30s idle, which zeroes the globals
+// above. Before this guard, a mid-recording eviction made the next icon click
+// START a new recording (active had reset to false) whose offscreen "start"
+// cleared the buffers — destroying the in-flight demo and shipping a 4-second
+// shell instead. The cure: the toggle/forwarding state lives in
+// chrome.storage.session (survives SW eviction, dies with the browser), and
+// every gate hydrates from it before trusting `recorder`.
+const REC_STATE_KEY = "recorder_state_v1";
+
+function persistRecorderState() {
+  chrome.storage.session
+    .set({
+      [REC_STATE_KEY]: {
+        active: recorder.active,
+        recordingId: recorder.recordingId,
+        startedAt: recorder.startedAt,
+        imgSeq: recorder.imgSeq,
+        lastVw: recorder.lastVw,
+        lastVh: recorder.lastVh
+      }
+    })
+    .catch(() => {});
+}
+
+async function hydrateRecorderState() {
+  try {
+    const { [REC_STATE_KEY]: s } = await chrome.storage.session.get(REC_STATE_KEY);
+    if (s && s.active && !recorder.active) {
+      recorder.active = true;
+      recorder.recordingId = s.recordingId;
+      recorder.startedAt = s.startedAt;
+      recorder.imgSeq = s.imgSeq || 0;
+      recorder.lastVw = s.lastVw || 0;
+      recorder.lastVh = s.lastVh || 0;
+      setBadge(true); // restore REC after an eviction mid-recording
+      chrome.action.setTitle({ title: "Recording… click to stop" });
+    }
+  } catch {}
+}
+// Kicked off at every SW (re)start; gates await it before reading `recorder`.
+const recorderReady = hydrateRecorderState();
+
+// Capture a 240p frame anchored to an event, at most once per second. The SW
+// grabs the visible tab; the offscreen doc resizes + stores it for the viewer;
+// the native host writes the file. The reference goes in the images track. All
+// best-effort — a dropped frame just means no file at that ref.
+async function maybeCapture(t) {
+  if (!recorder.active || !nativePort) return;
+  const now = Date.now();
+  if (now - recorder.lastCapture < 1000) return;
+  recorder.lastCapture = now;
+  let dataUrl;
+  try {
+    dataUrl = await chrome.tabs.captureVisibleTab({ format: "jpeg", quality: 60 });
+  } catch {
+    return; // not capturable (chrome:// page, no active tab, etc.)
+  }
+  const name = String(++recorder.imgSeq).padStart(5, "0") + ".jpg";
+  persistRecorderState(); // keep frame numbering monotonic across SW evictions
+  try {
+    const res = await chrome.runtime.sendMessage({
+      __ocic_offscreen: true,
+      cmd: "image",
+      t: t || now,
+      ref: "images/" + name,
+      vw: recorder.lastVw, // viewport this frame was captured at
+      vh: recorder.lastVh,
+      dataUrl
+    });
+    if (res && res.ok && res.dataUrl && nativePort) {
+      nativePort.postMessage({
+        type: "save_screenshot",
+        recording_id: recorder.recordingId,
+        name,
+        dataUrl: res.dataUrl
+      });
+    }
+  } catch {}
+}
+
+function newRecordingId() {
+  return "rec_" + Math.random().toString(36).slice(2, 10);
+}
+
+async function ensureOffscreen() {
+  const has = await chrome.offscreen.hasDocument?.();
+  if (has) return;
+  await chrome.offscreen.createDocument({
+    url: "recorder/offscreen.html",
+    reasons: ["USER_MEDIA", "CLIPBOARD"],
+    justification:
+      "Capture microphone narration, buffer the recording durably, and copy the recording reference to the clipboard on stop."
+  });
+}
+
+async function getApiKey() {
+  const { openai_api_key } = await chrome.storage.local.get("openai_api_key");
+  return openai_api_key || "";
+}
+
+// Validate the key BEFORE any recording — a recording with no transcript path
+// is a poor outcome, so we fail fast (§5).
+async function validateKey(apiKey) {
+  if (!apiKey) return { ok: false, error: "No OpenAI API key set. Add one in the extension options." };
+  try {
+    const res = await fetch("https://api.openai.com/v1/models", {
+      headers: { Authorization: `Bearer ${apiKey}` }
+    });
+    if (res.ok) return { ok: true };
+    if (res.status === 401) return { ok: false, error: "OpenAI API key is invalid." };
+    return { ok: false, error: `OpenAI returned ${res.status}.` };
+  } catch (e) {
+    return { ok: false, error: `Could not reach OpenAI: ${e.message}` };
+  }
+}
+
+function setBadge(on) {
+  chrome.action.setBadgeText({ text: on ? "REC" : "" });
+  if (on) chrome.action.setBadgeBackgroundColor({ color: "#d23b2e" });
+}
+
+// The "..." processing state: shown while the mic boots and while a stopped
+// recording is transcribed, saved, and copied. Clicks are ignored throughout.
+function setProcessingBadge(title) {
+  chrome.action.setBadgeText({ text: "\u2026" });
+  chrome.action.setBadgeBackgroundColor({ color: "#a5701a" });
+  chrome.action.setTitle({ title });
+}
+
+// A paste-able reference to a saved recording — the same text the Options
+// "Copy reference" button produces. Copied to the clipboard on stop so you can
+// paste it straight into Claude Code, regardless of any channel.
+function buildRecordingReference(path) {
+  return (
+    `Read the browser recording at ${path} — an imitation-learning rollout of an expert doing a task. ` +
+    `trace.json holds four tracks on one shared clock (behavior, cursor, images, narration); ` +
+    `SCHEMA_v0.md in that folder is the field reference, and images/ holds the frames.`
+  );
+}
+
+async function copyToClipboard(text) {
+  // The service worker has no clipboard; the offscreen document (created with
+  // the CLIPBOARD reason) does it via a textarea + execCommand. Awaited so the
+  // busy gate releases exactly when the reference is on the clipboard.
+  try {
+    const r = await chrome.runtime.sendMessage({ __ocic_offscreen: true, cmd: "copy", text });
+    return !!(r && r.ok);
+  } catch {
+    return false;
+  }
+}
+
+// Post-recording icon — same idea as REC while recording, so you see the
+// outcome without hovering (icon AND tooltip). On success the icon is a
+// clipboard (📋): the reference was copied to your clipboard. Delivery to
+// Claude, if any, is appended to the tooltip. Auto-clears a few seconds after
+// the last update; a new recording cancels the clear (see startRecording).
+let resultClearTimer = null;
+function scheduleBadgeClear() {
+  if (resultClearTimer) clearTimeout(resultClearTimer);
+  const ep = recorder.epoch; // this timer belongs to THIS result only
+  resultClearTimer = setTimeout(() => {
+    resultClearTimer = null;
+    if (recorder.epoch === ep && !recorder.active && !recorder.busy) {
+      chrome.action.setBadgeText({ text: "" });
+      chrome.action.setTitle({ title: "Open Claude in Chrome — click to start/stop recording" });
+    }
+  }, 4000);
+}
+function showResultBadge(kind) {
+  if (kind === "failed") {
+    chrome.action.setBadgeText({ text: "✗" });
+    chrome.action.setBadgeBackgroundColor({ color: "#d23b2e" });
+    chrome.action.setTitle({
+      title: "Could not save the recording — is the native host installed? Run ./install.sh."
+    });
+  } else {
+    // "copied" — the reference is on your clipboard. Delivery-to-Claude info
+    // arrives later and updates the TOOLTIP only (see stopRecording).
+    chrome.action.setBadgeText({ text: "📋" });
+    chrome.action.setBadgeBackgroundColor({ color: "#0e8a5f" });
+    chrome.action.setTitle({
+      title: "Recording saved · reference copied to clipboard — paste it into Claude Code."
+    });
+  }
+  scheduleBadgeClear();
+}
+
+async function broadcastRecordingState(on) {
+  const tabs = await chrome.tabs.query({});
+  for (const t of tabs) {
+    if (t.id != null)
+      chrome.tabs
+        .sendMessage(t.id, { __ocic: "recording_state", on })
+        .catch(() => {});
+  }
+}
+
+async function startRecording() {
+  // New transition: stale writers from any previous stop are dead from here.
+  recorder.epoch++;
+  if (resultClearTimer) {
+    clearTimeout(resultClearTimer);
+    resultClearTimer = null;
+  }
+  // Boot feedback at the INSTANT of the click — before the key validation
+  // network call — so the icon never looks dead after a press.
+  setProcessingBadge("Starting… validating key and warming up the microphone");
+  const apiKey = await getApiKey();
+  const v = await validateKey(apiKey);
+  if (!v.ok) {
+    // Surface via badge + a notification-free options nudge.
+    chrome.action.setTitle({ title: `Cannot record: ${v.error}` });
+    setBadge(false);
+    return { ok: false, error: v.error };
+  }
+  await ensureOffscreen();
+  recorder.recordingId = newRecordingId();
+  recorder.startedAt = Date.now();
+  recorder.imgSeq = 0;
+  recorder.lastCapture = 0;
+  const url0 = await activeTabUrl();
+  // Warm-up continues: REC appears only when the offscreen doc reports the
+  // mic ready (~2.5s later § muffled start).
+  chrome.action.setTitle({ title: "Starting microphone… wait for REC before talking" });
+  const startRes = await chrome.runtime.sendMessage({
+    __ocic_offscreen: true,
+    cmd: "start",
+    recording_id: recorder.recordingId,
+    started_at: recorder.startedAt,
+    apiKey,
+    url0
+  });
+  // Split-brain heal: the offscreen doc already has a live session (we lost
+  // track of it, e.g. session-state loss this hydration couldn't cover).
+  // ADOPT it — never clobber a recording in progress.
+  if (startRes && startRes.already && startRes.session) {
+    recorder.active = true;
+    recorder.recordingId = startRes.session.recording_id;
+    recorder.startedAt = startRes.session.started_at;
+    setBadge(true);
+    chrome.action.setTitle({ title: "Recording… click to stop" });
+    persistRecorderState();
+    return { ok: true, adopted: true };
+  }
+  // If the mic didn't start (permission not granted), fail LOUDLY — voice is
+  // core to a recording. Guide the operator to enable it in Options rather
+  // than silently capturing behavior with no narration.
+  if (!startRes || !startRes.ok) {
+    recorder.active = false;
+    persistRecorderState();
+    setBadge(false);
+    const err = (startRes && startRes.error) || "microphone unavailable";
+    chrome.action.setTitle({ title: `Can't record: ${err}` });
+    chrome.runtime.openOptionsPage();
+    return { ok: false, error: err };
+  }
+  recorder.active = true;
+  setBadge(true);
+  chrome.action.setTitle({ title: "Recording… click to stop" });
+  persistRecorderState();
+  await broadcastRecordingState(true);
+  return { ok: true };
+}
+
+async function stopRecording() {
+  const ep = ++recorder.epoch; // stale writers below check this before painting
+  const live = () => recorder.epoch === ep;
+  const tProc = Date.now();
+  recorder.active = false;
+  persistRecorderState();
+  setProcessingBadge("Processing recording\u2026 (transcribing, saving, copying)");
+  await broadcastRecordingState(false);
+  const res = await chrome.runtime.sendMessage({
+    __ocic_offscreen: true,
+    cmd: "stop"
+  });
+  if (!res || !res.ok) {
+    if (live()) chrome.action.setTitle({ title: "Recording failed to save." });
+    return { ok: false, error: res && res.error };
+  }
+  const { bundle } = res;
+  // 1) Persist to disk FIRST (reliability). Show the SAVE result immediately —
+  // it must not wait on the up-to-12s Claude ack below.
+  const path = await saveBundleToDisk(bundle).catch((e) => {
+    console.error("save failed", e);
+    return null;
+  });
+  if (!path) {
+    if (live()) showResultBadge("failed");
+    return { ok: false, error: "save failed" };
+  }
+  // 2) Copy the reference to the clipboard immediately — the primary, channel-
+  // independent feedback. Then show the clipboard icon.
+  await copyToClipboard(buildRecordingReference(path));
+  // Hold the "…" long enough to be SEEN even when the pipeline was instant
+  // (no audio -> no transcription): the stages must read consistently.
+  const hold = 800 - (Date.now() - tProc);
+  if (hold > 0) await sleep(hold);
+  if (live()) showResultBadge("copied");
+  recorder.busy = false; // reference on the clipboard: the icon is live again
+  // Record the on-disk path on the session so the Options viewer can copy it too.
+  chrome.runtime
+    .sendMessage({ __ocic_offscreen: true, cmd: "set_path", recording_id: bundle.recording_id, path })
+    .catch(() => {});
+  // 3) Notify Claude (best-effort); append delivery to the tooltip when it resolves.
+  // Delivery confirmation can arrive up to ~12s later. It must NEVER repaint
+  // the badge (a new recording may be underway by then) — tooltip only, and
+  // only while this stop is still the latest transition.
+  const connectionState = await notifyClaude(bundle, path);
+  if (live() && !recorder.active && !recorder.busy) {
+    const deliv =
+      connectionState === "delivered"
+        ? " Also delivered to Claude Code."
+        : connectionState === "sent_unconfirmed"
+          ? " Sent to Claude — delivery not confirmed."
+          : " No Claude Code session connected.";
+    chrome.action.setTitle({
+      title: "Recording saved · reference copied to clipboard — paste it into Claude Code." + deliv
+    });
+  }
+  return { ok: true, path, connectionState };
+}
+
+// Disk write goes through the NATIVE HOST (a Node process with fs), not
+// chrome.downloads — the browser download path pops an OS "save as" dialog on
+// some setups even with saveAs:false, and this writes to a stable location
+// (~/.config/open-claude-in-chrome/recordings/<id>/) the agent can open.
+// trace.json is small text; audio stays in IndexedDB. Returns the absolute
+// directory, or null if the native host isn't reachable.
+async function saveBundleToDisk(bundle) {
+  if (!nativePort) return null;
+  const schemaMd = await getSchemaMd();
+  const done = new Promise((resolve) => {
+    recorder.pendingSaves.set(String(bundle.recording_id), resolve);
+    setTimeout(() => {
+      if (recorder.pendingSaves.delete(String(bundle.recording_id))) resolve(null);
+    }, 8000);
+  });
+  try {
+    nativePort.postMessage({
+      type: "save_recording",
+      recording_id: bundle.recording_id,
+      schema: bundle.schema || "v0",
+      schema_md: schemaMd,
+      trace: bundle.trace
+    });
+  } catch {
+    recorder.pendingSaves.delete(String(bundle.recording_id));
+    return null;
+  }
+  return await done;
+}
+
+// The versioned schema descriptor, shipped into each bundle so the agent knows
+// how to read the trace. Read once from the packaged file, then cached.
+let _schemaMd = null;
+async function getSchemaMd() {
+  if (_schemaMd != null) return _schemaMd;
+  try {
+    const res = await fetch(chrome.runtime.getURL("recorder/SCHEMA_v0.md"));
+    _schemaMd = await res.text();
+  } catch {
+    _schemaMd = "";
+  }
+  return _schemaMd;
+}
+
+// Fire recording_complete upstream (→ native host → TCP → MCP server → channel
+// notification). Then wait briefly for Claude's recording_ack to know delivery
+// (§4). The native-host heartbeat tells us if any session is connected at all.
+async function notifyClaude(bundle, path) {
+  if (!nativePort) return "no_session"; // native host not connected
+  try {
+    nativePort.postMessage({
+      type: "recording_complete",
+      recording_id: bundle.recording_id,
+      path: path || "",
+      schema: bundle.schema,
+      summary: bundle.summary
+    });
+  } catch {
+    return "no_session";
+  }
+  // Await ack up to ~12s.
+  const acked = await waitForAck(bundle.recording_id, 12000);
+  return acked ? "delivered" : "sent_unconfirmed";
+}
+
+function waitForAck(recordingId, timeoutMs) {
+  if (recorder.deliveredIds.has(recordingId)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const iv = setInterval(() => {
+      if (recorder.deliveredIds.has(recordingId)) {
+        clearInterval(iv);
+        resolve(true);
+      } else if (Date.now() - start > timeoutMs) {
+        clearInterval(iv);
+        resolve(false);
+      }
+    }, 250);
+  });
+}
+
+
+async function activeTabUrl() {
+  try {
+    const [t] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    return t?.url || null;
+  } catch {
+    return null;
+  }
+}
+
+// The icon is a start/stop toggle (§9 — non-negotiable). Hydrate first: after
+// an SW eviction the in-memory flag is a lie, and acting on it destroys the
+// in-flight recording.
+chrome.action.onClicked.addListener(() => {
+  recorderReady
+    .then(() => {
+      // Busy = booting the mic or processing a stop: the click is IGNORED.
+      // The toggle is live only when idle, recording, or showing a result.
+      if (recorder.busy) return;
+      recorder.busy = true;
+      const op = recorder.active ? stopRecording() : startRecording();
+      return op.finally(() => {
+        recorder.busy = false; // safety net; the copied-path clears it earlier
+      });
+    })
+    .catch((e) => console.error("recorder toggle failed", e));
+});
+
+// Behavior events from content scripts → offscreen buffer. Tab segmentation.
+// Every gate awaits hydration: an event arriving right after SW wake-up must
+// still be forwarded to the (still-recording) offscreen buffer.
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!msg) return;
+  if (msg.__ocic === "behavior_event") {
+    recorderReady.then(() => {
+      if (!recorder.active) return;
+      if (msg.vw) { recorder.lastVw = msg.vw; recorder.lastVh = msg.vh; }
+      const evt = { ...msg, tab: sender.tab?.id ?? -1, frame: sender.frameId ?? 0 };
+      chrome.runtime
+        .sendMessage({ __ocic_offscreen: true, cmd: "event", event: evt })
+        .catch(() => {});
+      maybeCapture(msg.t); // frame anchored to this action (throttled ≤1/sec)
+    });
+    return;
+  }
+  if (msg.__ocic === "cursor_batch") {
+    recorderReady.then(() => {
+      if (!recorder.active) return;
+      if (msg.vw) { recorder.lastVw = msg.vw; recorder.lastVh = msg.vh; }
+      chrome.runtime
+        .sendMessage({ __ocic_offscreen: true, cmd: "cursor", points: msg.points })
+        .catch(() => {});
+      maybeCapture(); // frame during cursor activity (throttled ≤1/sec)
+    });
+    return;
+  }
+  if (msg.__ocic === "recorder_hello") {
+    recorderReady.then(() => sendResponse({ on: recorder.active }));
+    return true; // async response
+  }
+});
+
+// Tab + navigation events, captured in the SW so the trace has one-to-one
+// parity with OCIC's own commands (navigate, tab focus/create) — not just the
+// computer-tool primitives. Each carries the tab's URL so the trace records
+// what tab we're in and what the current URL is.
+async function recordSwEvent(action, tabId, extra = {}) {
+  await recorderReady; // SW may have just woken mid-recording
+  if (!recorder.active) return;
+  let url = extra.url;
+  if (url === undefined && tabId != null && tabId >= 0) {
+    try {
+      const t = await chrome.tabs.get(tabId);
+      url = t && t.url;
+    } catch {
+      url = undefined;
+    }
+  }
+  chrome.runtime
+    .sendMessage({
+      __ocic_offscreen: true,
+      cmd: "event",
+      event: {
+        t: Date.now(),
+        tab: tabId ?? -1,
+        frame: 0,
+        action,
+        // The core `command` key: the exact OCIC tool input (plus the event's
+        // tab as tabId). tab_activated has NO OCIC verb — tools select tabs
+        // via their tabId param — so it carries no command, only context.
+        command:
+          action === "navigate"
+            ? { tool: "navigate", input: { url } }
+            : action === "tab_opened"
+              ? { tool: "tabs_create_mcp", input: {} }
+              : action === "tab_closed"
+                ? { tool: "tabs_close_mcp", input: {} }
+                : undefined,
+        url: url || undefined // context enrichment (what URL the tab shows)
+      }
+    })
+    .catch(() => {});
+  maybeCapture(); // frame on navigation / tab change (throttled ≤1/sec)
+}
+
+// Focus/select a tab → tab_activated (with the URL now showing).
+chrome.tabs.onActivated.addListener((info) => recordSwEvent("tab_activated", info.tabId));
+// Open a tab → tab_opened.
+chrome.tabs.onCreated.addListener((tab) =>
+  recordSwEvent("tab_opened", tab.id, { url: tab.url || tab.pendingUrl })
+);
+// Close a tab → tab_closed.
+chrome.tabs.onRemoved.addListener((tabId) => recordSwEvent("tab_closed", tabId, { url: null }));
+// URL change in a tab (address bar, link, redirect, SPA history) → navigate.
+// This is what captures "the current state of the URL" as it changes.
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.url) recordSwEvent("navigate", tabId, { url: changeInfo.url });
+});
+
 // --- Init ---
 
-stateLoaded = loadGroupsState();
-stateLoaded.then(connectNativeHost);
+// Recover MCP tab group state after service worker restart
+async function recoverTabGroupState() {
+  try {
+    const groups = await chrome.tabGroups.query({ title: "MCP" });
+    if (groups.length > 0) {
+      tabGroupId = groups[0].id;
+      const tabs = await chrome.tabs.query({ groupId: tabGroupId });
+      tabGroupTabs = new Set(tabs.map((t) => t.id));
+    }
+  } catch {
+    // Not critical — will be set on first tabs_context_mcp call
+  }
+}
+
+recoverTabGroupState();
+connectNativeHost();

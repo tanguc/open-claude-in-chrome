@@ -63,6 +63,14 @@ let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 60; // 30 seconds at 500ms intervals
 const TCP_PORT = getPort();
 
+// When the primary rejects us because ANOTHER browser's host already holds
+// the native slot, retry slowly (15s) instead of hammering every 1.5s: with
+// two browsers running OCIC, the loser otherwise reconnect-spams the primary
+// and makes browser selection flap across primary restarts.
+let rejectedByPrimary = false;
+const RETRY_MS = 1500;
+const REJECTED_RETRY_MS = 15000;
+
 function connectTcp() {
   if (tcpSocket) return;
 
@@ -86,6 +94,11 @@ function connectTcp() {
       if (!line) continue;
       try {
         const msg = JSON.parse(line);
+        if (msg.type === "error" && /another browser profile/i.test(msg.error || "")) {
+          // The primary already has a browser attached; we are the loser of
+          // the slot. Back off hard instead of hammering every 1.5s.
+          rejectedByPrimary = true;
+        }
         // Forward to extension via native messaging
         writeNativeMessage(msg);
       } catch {
@@ -101,17 +114,80 @@ function connectTcp() {
   tcpSocket.on("close", () => {
     tcpSocket = null;
     if (!reconnectTimer) {
+      // Keep retrying indefinitely — do NOT exit when the MCP server is gone.
+      // The native host also writes recording bundles to disk (save_recording),
+      // which must work with no Claude session connected. Lifetime is tied to
+      // the extension (stdin), which ends on browser/extension shutdown below.
+      // Rejected-by-primary (another browser holds the slot): slow lane, and
+      // re-probe occasionally in case the winner's browser goes away.
+      const interval = rejectedByPrimary ? REJECTED_RETRY_MS : RETRY_MS;
+      rejectedByPrimary = false;
       reconnectTimer = setInterval(() => {
-        reconnectAttempts++;
-        if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
-          // MCP server is gone — exit cleanly so we don't linger as a zombie
-          clearInterval(reconnectTimer);
-          process.exit(0);
-        }
         if (!tcpSocket) connectTcp();
-      }, 500);
+      }, interval);
     }
   });
+}
+
+// --- Recording bundle write ---
+// The recorder saves the trace to disk here, in the native host, instead of
+// via chrome.downloads — the browser download path shows an OS save dialog on
+// some setups, and this also lets us write to a stable location the coding
+// agent can open. Returns the absolute directory so the extension can notify
+// Claude Code with a real path.
+function handleSaveRecording(msg) {
+  try {
+    const dir = path.join(
+      os.homedir(),
+      ".config",
+      "open-claude-in-chrome",
+      "recordings",
+      String(msg.recording_id || "unknown")
+    );
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "trace.json"),
+      JSON.stringify(msg.trace ?? {}, null, 2)
+    );
+    // Ship the schema descriptor alongside so the agent knows how to read it.
+    if (typeof msg.schema_md === "string" && msg.schema_md) {
+      fs.writeFileSync(path.join(dir, `SCHEMA_${msg.schema || "v0"}.md`), msg.schema_md);
+    }
+    writeNativeMessage({
+      type: "recording_saved",
+      recording_id: msg.recording_id,
+      path: dir,
+      ok: true
+    });
+  } catch (e) {
+    writeNativeMessage({
+      type: "recording_saved",
+      recording_id: msg.recording_id,
+      ok: false,
+      error: String(e && e.message)
+    });
+  }
+}
+
+// Write one 240p frame into the recording's images/ dir. Fire-and-forget:
+// the reference is already in the trace, so a dropped frame just means the
+// agent finds no file at that ref.
+function handleSaveScreenshot(msg) {
+  try {
+    const dir = path.join(
+      os.homedir(),
+      ".config",
+      "open-claude-in-chrome",
+      "recordings",
+      String(msg.recording_id || "unknown"),
+      "images"
+    );
+    fs.mkdirSync(dir, { recursive: true });
+    const b64 = String(msg.dataUrl || "").replace(/^data:image\/\w+;base64,/, "");
+    if (b64) fs.writeFileSync(path.join(dir, String(msg.name)), Buffer.from(b64, "base64"));
+  } catch {
+    // best-effort
+  }
 }
 
 // --- Main: bridge stdin (from extension) <-> TCP (to MCP server) ---
@@ -124,7 +200,16 @@ process.stdin.on("data", (chunk) => {
   stdinBuffer = remainder;
 
   for (const msg of messages) {
-    // Forward to MCP server via TCP
+    // Handle recording saves locally (write to disk + reply); don't forward.
+    if (msg && msg.type === "save_recording") {
+      handleSaveRecording(msg);
+      continue;
+    }
+    if (msg && msg.type === "save_screenshot") {
+      handleSaveScreenshot(msg);
+      continue;
+    }
+    // Forward everything else to the MCP server via TCP.
     if (tcpSocket && !tcpSocket.destroyed) {
       tcpSocket.write(JSON.stringify(msg) + "\n");
     }

@@ -1,12 +1,40 @@
-# Open Claude in Chrome
+<p align="center">
+  <img src="extension/icons/icon128.png" width="96" alt="Open Claude in Chrome">
+</p>
 
-**Claude in Chrome, fully open source. No domain blocklist. Any Chromium browser.**
+<h1 align="center">Open Claude in Chrome</h1>
 
-The official [Claude in Chrome](https://code.claude.com/docs/en/chrome) extension gives Claude Code full browser automation. Open Claude in Chrome is a clean-room reimplementation that removes the restrictions while maintaining 100% feature and performance parity.
+<p align="center">
+  <em>Official Claude in Chrome gives you 58 blocked domains and two browsers.<br/>
+  <strong>Open Claude in Chrome gives you the whole web.</strong></em>
+  <br/>
+  <sub>Clean-room reimplementation of Anthropic's browser extension. No blocklist. Any Chromium browser. 100% feature &amp; performance parity.</sub>
+  <br/>
+  <sub>by <a href="https://noemica.io">noemica</a></sub>
+</p>
 
-[![Demo](https://img.youtube.com/vi/n4-2fjOsGhw/maxresdefault.jpg)](https://youtu.be/n4-2fjOsGhw)
+<p align="center">
+  <a href="#whats-different">What's different</a> ·
+  <a href="#installation">Install</a> ·
+  <a href="#imitation-learning-recording">Imitation learning</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="https://youtu.be/n4-2fjOsGhw">Demo</a> ·
+  <a href="https://www.noemica.io/blog/reverse-engineered-claude-in-chrome">How I built it</a>
+</p>
 
-> **Demo:** [Watch Claude on Tinder, Reddit, and Robinhood](https://youtu.be/n4-2fjOsGhw) | **Deep dive:** [How I reverse-engineered it](https://www.noemica.io/blog/reverse-engineered-claude-in-chrome)
+---
+
+<p align="center">
+  <a href="https://youtu.be/n4-2fjOsGhw">
+    <img src="https://img.youtube.com/vi/n4-2fjOsGhw/maxresdefault.jpg" alt="Demo — Claude on Tinder, Reddit, and Robinhood" width="820"/>
+  </a>
+  <br/>
+  <sub><em>Watch Claude navigate Tinder, Reddit, and Robinhood — sites the official extension can't reach.</em></sub>
+</p>
+
+---
+
+The official [Claude in Chrome](https://code.claude.com/docs/en/chrome) extension gives Claude Code full browser automation — as long as you stay within Anthropic's allowlist of "safe" sites. Open Claude in Chrome is a clean-room reimplementation that strips the restrictions while keeping all 18 MCP tools and matching the official extension's performance.
 
 ## What's Different
 
@@ -38,8 +66,26 @@ Open Claude in Chrome has **none of these restrictions**.
 
 ## Architecture
 
+Default:
+
 ```
 Claude Code <--stdio MCP--> mcp-server.js <--TCP--> native-host.js <--native messaging--> Extension <--> Browser
+```
+
+Code mode / hybrid (additive — `mcp-server.js` is reused unchanged as the upstream):
+
+```
+Claude Code <--stdio MCP--> server-{codemode,hybrid}.js
+                              |  spawns + proxies via MCP
+                              v
+                            mcp-server.js (child) <--TCP--> native-host.js <--native messaging--> Extension <--> Browser
+                              ^
+                              |  HTTP tool-callback
+                              |
+                            workerd (wrangler dev sidecar)
+                              |  Worker Loader → V8 isolate
+                              v
+                            sandboxed Worker runs LLM-written code
 ```
 
 Three components:
@@ -47,13 +93,19 @@ Three components:
 2. **MCP Server** — Node.js process started by Claude Code, exposes tools via MCP
 3. **Native Messaging Host** — Bridge between the MCP server and the extension
 
+The codemode and hybrid servers add a fourth piece — a `wrangler dev` subprocess hosting a Cloudflare Worker that runs the LLM-generated code in a V8 isolate. The Worker calls back to the proxy over HTTP for actual tool execution, which is forwarded to the unchanged upstream `mcp-server.js`.
+
 ## Installation
+
+One flow, top to bottom, turns everything on — all 18 browser tools,
+`execute_code`, and the imitation-learning recorder.
 
 ### Prerequisites
 
 - **Node.js** v18+
 - **Any Chromium browser** (Chrome, Edge, Brave, Arc, Opera, Vivaldi, etc.)
-- **Claude Code** v2.0.73+
+- **Claude Code** v2.1.80+ (the recorder needs channels; browser automation alone works on v2.0.73+)
+- **An OpenAI API key** (used to transcribe recording narration)
 
 ### Step 1: Install dependencies
 
@@ -76,27 +128,64 @@ cd ..
 ./install.sh <your-extension-id>
 ```
 
-If you use multiple browsers, pass all IDs:
-
-```bash
-./install.sh <chrome-id> <brave-id> <arc-id>
-```
+If you use multiple browsers, pass all IDs: `./install.sh <chrome-id> <brave-id> <arc-id>`
 
 ### Step 4: Restart your browser
 
 Close **all** windows and reopen. The browser reads native messaging host configs on startup.
 
-### Step 5: Add to Claude Code
+### Step 5: Set your OpenAI key and enable the microphone
 
+Right-click the extension icon → **Options**. Both of these are required before
+recording:
+
+- Paste your **OpenAI key** and click **Save & validate** (transcribes your narration).
+- Click **Enable microphone** and allow the browser prompt. The recorder captures
+  audio in a background page that can't show a permission prompt itself, so you
+  grant mic access once here; otherwise recordings capture no voice.
+
+### Step 6: Add the server to Claude Code
+
+The **hybrid** server exposes everything: all 18 tools directly, `execute_code`
+alongside (the model picks per call), and the recording channel.
+
+```bash
+claude mcp add open-claude-in-chrome-hybrid -- node /absolute/path/to/host/codemode/server-hybrid.js
+```
+
+Find the absolute path with `echo "$(pwd)/host"`.
+
+### Step 7: Launch with recording enabled
+
+Channels are a research preview, so start Claude Code with the development flag
+(the name is the server from step 6):
+
+```bash
+claude --dangerously-load-development-channels server:open-claude-in-chrome-hybrid
+```
+
+Accept the one-time prompt and keep the session open — channels inject into a
+live interactive session, not `claude -p`. That's it: browser automation and
+recording are both on.
+
+<details>
+<summary>Other server variants (optional)</summary>
+
+The hybrid server above is the superset. Two leaner variants exist if you want
+them (they can coexist; register more than one):
+
+**Default** — the 18 tools, nothing else:
 ```bash
 claude mcp add open-claude-in-chrome -- node /absolute/path/to/host/mcp-server.js
 ```
 
-Find the absolute path with:
-
+**Code mode** — three tools: `execute_code`, `screenshot`, `zoom`. The model writes JS that calls `chrome.*` (the typed API for all 18 tools) in a sandboxed Cloudflare Worker, collapsing multi-step flows into one round trip:
 ```bash
-echo "node $(pwd)/host/mcp-server.js"
+claude mcp add open-claude-in-chrome-codemode -- node /absolute/path/to/host/codemode/server-codemode.js
 ```
+
+The first call on either codemode/hybrid variant pays a one-time ~3–5s cost while `wrangler dev` boots the sandbox; subsequent calls are fast. The Workerd sidecar is spawned and torn down with the MCP server. These variants depend on `npx wrangler`, pulled automatically on first launch. Recording is only on the hybrid server.
+</details>
 
 ## Verification
 
@@ -108,14 +197,130 @@ Navigate to reddit.com and take a screenshot
 
 Reddit loads. No domain restriction.
 
+## Imitation Learning (Recording)
+
+Teach Claude Code a browser task by doing it once. The extension records an
+expert rollout in two synchronized tracks — **what you did** (clicks, typing,
+scrolling, resolved to durable element anchors) and **why** (your spoken
+narration, transcribed) — across every tab, then hands the recording to a live
+Claude Code session over a [channel](https://code.claude.com/docs/en/channels).
+Claude reads the rollout and carries out the task, extrapolating to sister
+tasks. Enabled by the [Installation](#installation) flow above. Full design:
+[`docs/imitation-learning-alignment.html`](docs/imitation-learning-alignment.html).
+
+### Record
+
+1. Tell the session you're about to teach it something.
+2. **Click the toolbar icon** to start. The badge walks a fixed pipeline:
+   `…` (booting the mic, ~2.5s) → `REC` (talk now). Clicks during `…` are
+   ignored.
+3. Act and narrate out loud. Hold **Alt** while clicking to demonstrate an
+   action *without* it firing (override/mask mode).
+4. **Click the icon again** to stop. The badge shows `…` while the recording
+   is transcribed and saved — clicks are ignored until the **paste-able
+   reference lands on your clipboard** and the icon shows 📋. Only then is the
+   icon live again. Paste the reference into Claude Code to point it at the
+   recording. (If a Claude session with the channel is connected, it's also
+   notified automatically and the tooltip says so — but the clipboard copy
+   happens either way.)
+
+Recorded sessions are browsable under the extension's **Options** page (all
+captured data, disclosed in layers), each with its own **Copy reference** button.
+
+### Verify recording works
+
+The minimum end-to-end check, the recorder's equivalent of the reddit test
+above. Do it in a session launched per step 7.
+
+1. In the Claude Code session, say: *"I'm going to teach you something — wait for my signal."*
+2. **Click the toolbar icon** (badge shows `REC`). Navigate to any page, click a
+   couple of things, and **say two or three sentences out loud** about what
+   you're doing. **Click the icon again** to stop.
+3. Confirm:
+   - The icon shows a **📋** and the reference is on your clipboard (paste it
+     anywhere to check — it points at the recording folder).
+   - **Options → Recorded sessions** shows the session with events > 0,
+     **utterances > 0**, a working **audio player**, a **frame count**, and your
+     words under **Narration**.
+   - `trace.json` and `images/` exist under
+     `~/.config/open-claude-in-chrome/recordings/<recording_id>/`.
+   - If a channel session is connected: a `<channel … event="recording_complete" …>`
+     message appears and Claude acknowledges it and reads the trace.
+
+If utterances is 0 or there's no audio, the mic wasn't enabled — redo
+Installation step 5. If nothing saved (no 📋), the native host isn't running —
+rerun `./install.sh <extension-id>` and restart the browser. If no channel
+message appears, the session wasn't launched with the flag in step 7 (or a
+stale MCP server is running — `pkill -f "server-hybrid"` and reconnect with
+`/mcp`).
+
+**The real test** (beyond the minimum): one narrated rollout of a task, then a
+*sister task* — same shape, different specifics — that Claude completes unaided
+from the recording. That's the proof the trace teaches rather than replays.
+
+### Status & limitations
+
+The MCP channel, the `recording_ack` round-trip, the primary→client event
+routing, the transcription + track merge, and the native-host file writes are
+validated outside the browser; the in-browser capture, mic, and stop pipeline
+are wired and awaiting your live pass above. Known v1 choices:
+
+- The bundle is written by the **native host** (a Node process with filesystem access) to `~/.config/open-claude-in-chrome/recordings/<id>/` — `trace.json`, `SCHEMA_v0.md`, and `images/`. No `chrome.downloads`, so no OS save dialog, and it saves whether or not Claude is connected.
+- **Four tracks**: behavior (discrete actions), cursor (raw trajectory), images (240p frames captured on events, ≤1/sec), narration. All references and files are just data; the agent reads what it wants.
+- The viewer keeps small copies of the audio and frames in IndexedDB (the Options page can't read the on-disk files). Long recordings accumulate; a "keep last N" cleanup is a later refinement.
+- The capture layer is purpose-built (anchors + effects + heuristics), not a vendored rrweb.
+
+## Code Mode Test Client
+
+A self-explanatory in-browser test suite for comparing default / code-mode / hybrid behavior across the kinds of flow they each should excel at. Lives in `scratch/test-form/`.
+
+### Serve it
+
+```bash
+cd scratch/test-form
+python3 -m http.server 8765
+```
+
+Open `http://localhost:8765/`. The page is a four-challenge suite the agent works through end-to-end:
+
+1. **Single-Screen Form** — everything visible in one screenshot. A model that captures the layout once should be able to batch all clicks + types + submit into a single round trip.
+2. **Multi-Step Wizard** — three steps where step 2's fields depend on step 1's choice. Forces screenshot → action → screenshot, no batching across steps.
+3. **Repeat Submissions** — the same Challenge 1 form, submitted three times with different values. Coordinates don't change; this is where pre-planned batching pays off most.
+4. **Click Sequence** — a 3×3 grid plus a randomly-generated ordering. Every coordinate is visible at once; the model can batch nine sequential clicks from one screenshot.
+
+Completion is non-ambiguous: the suite ends on a green "All Challenges Complete" banner with a per-challenge wall-clock table. A sticky progress header on every page shows the current challenge number and a ✓ for each completed one.
+
+### Run the experiment
+
+```
+YOU MUST NOT USE THE FOLLOWING TOOLS IN ANY CAPACITY: form_input || javascript_tool
+
+TASK:
+Open http://localhost:8765/ on a new tab and complete every challenge on the page. Follow the on-page instructions until you reach the "All Challenges Complete" banner.
+
+For the MCP use only (not any of the other ocic MCPs): open-claude-in-chrome||open-claude-in-chrome-codemode||open-claude-in-chrome-hybrid
+```
+
+What to look for across the three MCP variants:
+- Challenge 1: ratio of screenshots to actions. Default tends to look-act-look-act; code-mode/hybrid should look once then batch.
+- Challenge 2: all three should look comparable — visual feedback is required between steps regardless of MCP.
+- Challenge 3: this is where the gap should open. One screenshot up front, then three batched form-fills in code-mode/hybrid vs. fresh look-act loops in default.
+- Challenge 4: similar. Coordinates fixed, sequence visible. Code mode batches the nine clicks; default clicks one at a time.
+
+If the model still uses direct tools on the second submission, that's a signal the `execute_code` description needs tuning — see `host/codemode/common.js` (`buildExecuteCodeDescription`) and the per-server `EXTRA_NOTES`.
+
+#### Results
+
+#### Final Results Table
+
 ## Available Tools
 
-The 18 tools from Claude in Chrome, plus `healthcheck` (this fork):
+All 18 tools, identical to Claude in Chrome:
 
 | Tool | Description |
 |------|-------------|
-| `tabs_context_mcp` | Establish or inspect a NAMED tab group (entry point for every session) |
-| `tabs_create_mcp` | Add a new tab to your named group |
+| `tabs_context_mcp` | Get tab group context |
+| `tabs_create_mcp` | Create new tab |
 | `navigate` | Navigate to URL, back, forward |
 | `computer` | Mouse, keyboard, screenshots (13 actions) |
 | `read_page` | Accessibility tree with element refs |
@@ -132,36 +337,6 @@ The 18 tools from Claude in Chrome, plus `healthcheck` (this fork):
 | `shortcuts_execute` | Run shortcut (stub) |
 | `switch_browser` | Switch browser (stub) |
 | `update_plan` | Present plan (auto-approved) |
-| `healthcheck` | Diagnose the stack — mcp-server + native host + extension state, with concrete `advice` for next steps. **Call this BEFORE falling back to another browser tool.** |
-
-## Named Tab Groups (multi-agent)
-
-Multiple agents — different repos, different sessions, different sub-agents — can share one Chrome instance without stepping on each other's tabs. The mechanism is **named tab groups**: each agent owns a group identified by a unique `groupName`, and each group lives in its **own dedicated browser window**. Spread them across monitors, minimize the ones you aren't watching, close an agent's window to end its session — they're first-class Chrome windows.
-
-**Contract for every agent session:**
-
-```
-1. tabs_context_mcp({ groupName: "<your-name>", createIfEmpty: true, color: "<color>" })
-   → opens a new browser window, creates the named group inside it, returns your first tabId
-2. tabs_create_mcp({ groupName: "<your-name>" })
-   → adds another tab to YOUR group (in YOUR window), returns its tabId
-3. navigate / computer / find / read_page / ... ({ tabId: <yours>, ... })
-   → operate only on tabIds you own
-```
-
-`groupName` is **required** for `tabs_create_mcp` and required when `createIfEmpty: true` on `tabs_context_mcp`. Calling `tabs_context_mcp()` with no arguments returns the topology of **all** groups currently managed by the extension (useful for orchestrators).
-
-**Pick a meaningful groupName.** Examples: `agent-foo`, `sergen-claude`, `research-bot`, `<repo-name>`. The group name is the per-tab metadata that distinguishes which agent owns which tab — both for the user (visible as the window's tab-group label in the Chrome tab strip) and for any orchestrator inspecting the topology.
-
-**Pick a distinct color.** Valid: `grey`, `blue`, `red`, `yellow`, `green`, `pink`, `purple`, `cyan`, `orange`. Defaults to `blue`. Color is set on first creation and is also visible in the tab strip.
-
-**One group = one window.** Every bootstrap spawns a fresh Chrome window containing one blank tab, and immediately wraps that tab in the named group. Parallel bootstraps don't coordinate — they each create their own window independently. This makes it easy to spatially separate agents (drag to different monitors, stack vs tile, etc.) and to end an agent's session by simply closing its window.
-
-**State persists.** The set of named groups is stored in `chrome.storage.local`. After a service-worker eviction or browser restart, the extension re-discovers its groups by name and rebuilds in-memory state. Agents reconnecting in a later session can pass the same `groupName` to resume (Chrome will have re-opened the window on its side; if the window was closed, a new one is created on the next bootstrap).
-
-**Tab cleanup.** Closing the last tab in a group auto-removes the group and its containing window (Chrome behavior). The extension drops the group from its persisted state on `chrome.tabs.onRemoved`. To intentionally end an agent's session, close its window.
-
-**Concurrency.** All tool calls across different `tabId`s run in parallel through a single TCP / native-messaging pipe; the mcp-server tracks each in-flight request by ID and the extension's async tool handlers execute them independently. The per-name de-dup lock prevents two concurrent bootstraps for the same `groupName` from racing.
 
 ## Updating After Code Changes
 
@@ -169,8 +344,9 @@ No build step. All files are plain JavaScript. After pulling or editing code:
 
 | What changed | What to do |
 |---|---|
-| `extension/background.js` or `extension/content.js` or `extension/manifest.json` | Reload the extension: `brave://extensions` > click the reload icon |
+| `extension/background.js`, `extension/content.js`, `extension/manifest.json`, or `extension/recorder/*` | Reload the extension: `brave://extensions` > click the reload icon |
 | `host/mcp-server.js` | Kill stale servers and reconnect: `pkill -f "node.*mcp-server"` then `/mcp` in Claude Code |
+| `host/codemode/*.js` or `host/codemode/worker/*` | Kill the codemode server: `pkill -f "server-codemode\|server-hybrid"` and `pkill -f wrangler`, then `/mcp` in Claude Code |
 | `host/native-host.js` | Restart the browser (close all windows, reopen) |
 | `install.sh` or native host name changed | Re-run `./install.sh <extension-id>`, restart browser, re-add MCP |
 
@@ -206,29 +382,7 @@ pkill -f "node.*mcp-server"
 
 ## Troubleshooting
 
-### First step: call `healthcheck`
-
-Before guessing, ask the stack to tell you what's wrong:
-
-```
-mcp__open-claude-in-chrome__healthcheck()
-```
-
-It returns the mcp-server's mode + bind address, the native-host connection state with timestamps, the extension's reported state (groups, attached tabs, version), and an `advice` field with concrete next steps. Use this to distinguish transient issues (worker reconnecting in a few seconds) from permanent ones (extension never installed). Agents should call this BEFORE deciding to fall back to a different browser tool.
-
-### Failure-mode taxonomy
-
-| Symptom | Most likely cause | Fix |
-|---|---|---|
-| `healthcheck` says `nativeHostEverConnected: false` | The extension has never connected to this MCP server. Either Chrome isn't running, the extension is disabled, or `install.sh` was never run for this extension ID. | Open Chrome, enable the extension at `chrome://extensions`, run `./install.sh <id>`, restart the browser. |
-| `healthcheck` says `nativeHostSocketConnected: false` but `nativeHostEverConnected: true` | The Chrome service worker was evicted. The keep-alive alarm reconnects every ~24 s. | Open any tab in the browser to wake the worker, retry in a few seconds. |
-| `healthcheck` says `extensionReachable: false` but `nativeHostSocketConnected: true` | Service worker is hung or crashed mid-handler. | Reload the extension at `chrome://extensions`. |
-| `healthcheck` succeeds but tool calls still time out | Tool dispatch hung inside the extension. | Reload the extension. If repeats, file an issue. |
-| MCP server reports disconnected immediately at session start | A stale `mcp-server.js` from an earlier session is holding the TCP port and the extension is connected to it instead. | `pkill -f "node.*mcp-server"`, then `/mcp` to reconnect. |
-| Tools work but new groups end up in their own browser windows instead of sharing one | Pre-multi-group fork, or the global creation mutex isn't in place. | Update to the latest fork (post-`feat: named tab groups for multi-agent isolation`). |
-| `healthcheck` shows the wrong `port` | Custom config under `~/.config/open-claude-in-chrome/config.json` is overriding the default. | Either accept it or remove the config and restart browser + MCP server. |
-
-### Extension not connecting (manual checks)
+### Extension not connecting
 
 1. Verify the extension is loaded and enabled
 2. Check that `./install.sh` was run with the correct extension ID
