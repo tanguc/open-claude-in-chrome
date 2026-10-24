@@ -171,13 +171,13 @@ function failPending() {
   pendingRequests.clear();
 }
 
-function sendToExtension(tool, args) {
+function sendToExtension(tool, args, timeoutMs = REQUEST_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const id = String(++requestIdCounter);
     const timer = setTimeout(() => {
       pendingRequests.delete(id);
-      reject(new Error("Tool request timed out after 60s"));
-    }, REQUEST_TIMEOUT_MS);
+      reject(new Error(`Tool request timed out after ${timeoutMs / 1000}s`));
+    }, timeoutMs);
     const entry = { resolve, reject, timer, sent: false };
     pendingRequests.set(id, entry);
 
@@ -250,6 +250,34 @@ function textResult(text) {
   return { content: [{ type: "text", text }] };
 }
 
+async function healthcheck() {
+  const report = {
+    mcpServer: {
+      pid: process.pid,
+      mode: "client",
+      transport: process.platform === "win32" ? "named-pipe" : "unix-socket",
+      endpoint: PIPE_PATH
+    },
+    extensionReachable: false
+  };
+  try {
+    const result = await sendToExtension("healthcheck", {}, 5000);
+    report.extension = result?.content
+      ? JSON.parse(result.content.find((block) => block.type === "text").text)
+      : result;
+    report.extensionReachable = true;
+    report.advice = "Browser bridge and extension are reachable.";
+  } catch (err) {
+    report.error = err.message;
+    report.advice = "Check that the browser is running and the extension is enabled. " +
+      "After a host update, rerun install.sh to refresh the internal copy and restart the browser. " +
+      "The host and MCP server must use the same pipe configuration.";
+  }
+  report.mcpServer.bridgeConnected = !!linkIsUp();
+  report.mcpServer.pendingRequests = pendingRequests.size;
+  return textResult(JSON.stringify(report, null, 2));
+}
+
 /**
  * Call a tool on the extension. Returns an MCP CallToolResult envelope
  * (with text/image/etc. content blocks).
@@ -259,6 +287,7 @@ function textResult(text) {
  */
 export async function callTool(toolName, args) {
   noteActivity();
+  if (toolName === "healthcheck") return healthcheck();
   try {
     const coerced = coerceArgs(args ?? {});
     const result = await sendToExtension(toolName, coerced);

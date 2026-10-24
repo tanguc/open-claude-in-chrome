@@ -42,8 +42,8 @@ The official [Claude in Chrome](https://code.claude.com/docs/en/chrome) extensio
 |---|---|---|
 | **Domain blocklist** | 58 blocked domains across 11 categories | No blocklist. Navigate anywhere. |
 | **Browser support** | Chrome and Edge only | Any Chromium browser (Chrome, Edge, Brave, Arc, Opera, Vivaldi, etc.) |
-| **Source code** | Closed source | Open source (MIT) |
-| **Tools** | 21 MCP tools | Same 21 MCP tools |
+| **Source code** | Closed source | Source-available, [PolyForm Noncommercial](LICENSE) |
+| **Tools** | 21 MCP tools | Browser tools plus named groups, diagnostics and recording |
 | **Performance** | Baseline | Identical |
 
 ### Blocked Domains in the Official Extension
@@ -101,34 +101,15 @@ grading is ambiguous, and repeat runs of an identical configuration vary by
 
 ## Architecture
 
-Default:
-
 ```
-Claude Code <--stdio MCP--> mcp-server.js <--TCP--> native-host.js <--native messaging--> Extension <--> Browser
+Claude Code <--stdio MCP--> MCP frontend --> tool-runtime.js <--local pipe--> native-host.js <--native messaging--> Extension <--> Browser
 ```
 
-Code mode / hybrid (additive — `mcp-server.js` is reused unchanged as the upstream):
+The browser owns the native host, which serves the local bridge. All MCP sessions are clients; no session owns a shared TCP port or elects a primary. The rendezvous is a Unix socket on macOS/Linux and a named pipe on Windows.
 
-```
-Claude Code <--stdio MCP--> server-{codemode,hybrid}.js
-                              |  spawns + proxies via MCP
-                              v
-                            mcp-server.js (child) <--TCP--> native-host.js <--native messaging--> Extension <--> Browser
-                              ^
-                              |  HTTP tool-callback
-                              |
-                            workerd (wrangler dev sidecar)
-                              |  Worker Loader → V8 isolate
-                              v
-                            sandboxed Worker runs LLM-written code
-```
+The standard, codemode and hybrid frontends share `host/tool-runtime.js` and `host/tool-definitions.js` in-process. Codemode and hybrid also launch a local `wrangler dev` sidecar for sandboxed `execute_code`; its HTTP tool callbacks use that same runtime, without spawning a child `mcp-server.js`.
 
-Three components:
-1. **Extension** — Manifest V3 with CDP-based browser automation (all 21 tools)
-2. **MCP Server** — Node.js process started by Claude Code, exposes tools via MCP
-3. **Native Messaging Host** — Bridge between the MCP server and the extension
-
-The codemode and hybrid servers add a fourth piece — a `wrangler dev` subprocess hosting a Cloudflare Worker that runs the LLM-generated code in a V8 isolate. The Worker calls back to the proxy over HTTP for actual tool execution, which is forwarded to the unchanged upstream `mcp-server.js`.
+On macOS, `install.sh` copies the native host, `endpoint.js` and its ESM package metadata to `~/Library/Application Support/open-claude-in-chrome/`. This keeps the browser-launched code off removable volumes. Linux uses `~/.local/share/open-claude-in-chrome/`. The repository remains the source of truth; reinstall after changing either installed module.
 
 ## Installation
 
@@ -419,9 +400,11 @@ Every tool, its purpose, and its parity with the official Claude in Chrome exten
 
 | Tool | Purpose | Parity |
 |------|---------|:------:|
-| `tabs_context_mcp` | Get tab group context | ✓ |
-| `tabs_create_mcp` | Create a new tab | ✓ |
-| `tabs_close_mcp` | Close a tab | ✓ |
+| `tabs_context_mcp` | Inspect or establish a named agent group | |
+| `tabs_create_mcp` | Create a background tab in a named group | |
+| `tabs_close_mcp` | Close managed tab IDs, skipping unmanaged ones | |
+| `close_tabs` | Close a named group or a strictly validated batch of managed tabs | |
+| `healthcheck` | Diagnose the runtime, browser bridge and extension | |
 | `navigate` | Navigate to URL, back, forward | ✓ |
 | `computer` | Mouse, keyboard, screenshot, zoom | ✓ |
 | `read_page` | Accessibility tree with element refs | ✓ |
@@ -575,10 +558,10 @@ No build step. All files are plain JavaScript. After pulling or editing code:
 
 | What changed | What to do |
 |---|---|
-| `extension/background.js`, `extension/content.js`, `extension/manifest.json`, or `extension/recorder/*` | Reload the extension: `brave://extensions` > click the reload icon |
-| `host/mcp-server.js` | Kill stale servers and reconnect: `pkill -f "node.*mcp-server"` then `/mcp` in Claude Code |
-| `host/codemode/*.js` or `host/codemode/worker/*` | Kill the codemode server: `pkill -f "server-codemode\|server-hybrid"` and `pkill -f wrangler`, then `/mcp` in Claude Code |
-| `host/native-host.js` | Restart the browser (close all windows, reopen) |
+| `extension/background.js`, `extension/groups.js`, `extension/content.js`, `extension/manifest.json`, or `extension/recorder/*` | Reload the extension in the browser's extensions page |
+| `host/mcp-server.js`, `host/tool-runtime.js`, or `host/tool-definitions.js` | Reconnect the affected MCP server through `/mcp` |
+| `host/codemode/*.js` or `host/codemode/worker/*` | Stop only the affected server and its sidecar, then reconnect through `/mcp` |
+| `host/native-host.js` or `host/endpoint.js` | Re-run `./install.sh <extension-id>` to refresh the internal copy, then restart the browser |
 | `install.sh` or native host name changed | Re-run `./install.sh <extension-id>`, restart browser, re-add MCP |
 
 ### Quick reset (nuclear option)
@@ -602,14 +585,23 @@ pkill -f "node.*mcp-server"
 
 ## Multiple Sessions
 
-Multiple Claude Code sessions can share the same browser extension. The first session becomes the "primary" (owns the TCP port), and subsequent sessions connect as clients through the primary. All sessions can use the browser simultaneously.
+Each session connects directly to the browser-owned bridge. Closing one MCP session does not disconnect the others.
 
-If a session disconnects, kill stale servers and reconnect:
+Each agent establishes a named workspace:
 
-```bash
-pkill -f "node.*mcp-server"
-# then /mcp in each Claude Code session
+```javascript
+tabs_context_mcp({ groupName: "research", createIfEmpty: true, color: "green" })
+tabs_create_mcp({ groupName: "research" })
+close_tabs({ groupName: "research" })
 ```
+
+One group occupies one dedicated window. Creation does not raise the window or select new tabs; use `set_tab_focus` when that is intentional. Names and colors persist across service-worker restarts. `groupName` is required for creation; `tabs_context_mcp({})` lists all managed groups without creating anything.
+
+Operate only on tab IDs returned for your own group and close them when finished. The extension checks membership in any managed group, not an authenticated session identity: named groups are a coordination contract, not a security boundary between mutually untrusted agents. Moving a tab outside managed groups revokes access.
+
+`close_tabs` validates the whole batch before closing anything and rejects unmanaged IDs. The upstream `tabs_close_mcp` API remains available and skips unmanaged IDs. Closing the last tab removes its group and window.
+
+Call `healthcheck` before resetting processes. Its JSON reports the local transport, connection state, extension groups and next steps. A host update requires reinstalling the internal copy; restarting the browser alone does not copy changed files.
 
 ## Community
 
@@ -671,6 +663,6 @@ up a whole host + client fleet without touching a live install.
 
 ## License
 
-MIT
+The current upstream code is provided under [PolyForm Noncommercial 1.0.0](LICENSE). These terms permit noncommercial use; commercial use requires a separate license. Third-party components retain their own license notices.
 
 Built by [Sebastian Sosa](https://github.com/CakeCrusher) ([Noemica](https://noemica.io))

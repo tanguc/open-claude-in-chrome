@@ -28,9 +28,11 @@ const state = { tabs:[{id:100,windowId:7,active:true,groupId:55}], groupId:55, c
 globalThis.chrome = mkChrome(state);
 
 // deps the handlers close over
-let tabGroupId = 55; let tabGroupTabs = new Set([100]);
+const mcpGroups = {
+  name: (name) => name,
+  ensure: async () => ({ id: 55, color: "blue", tabIds: new Set([100]) })
+};
 const isInGroup = async (id) => state.tabs.some(t=>t.id===id);
-const ensureTabGroup = async () => {};
 const formatTabContext = (tabs) => ({content:[{type:"text",text:JSON.stringify({availableTabs:tabs.map(t=>({tabId:t.id}))})}]});
 const CONFIG_KEY="ocic_config_v1", TAB_CONFIG_KEY="ocic_tab_config_v1";
 const CONFIG_SCHEMA={humanize:"drive input like a person"};
@@ -51,15 +53,15 @@ const src = [
   extractFunction("effectiveConfig"),
   extractFunction("writeConfig")
 ].join("\n\n");
-const mk = new Function("chrome","tabGroupId","tabGroupTabs","isInGroup","ensureTabGroup","formatTabContext",
+const mk = new Function("chrome","mcpGroups","isInGroup","formatTabContext",
   "CONFIG_KEY","TAB_CONFIG_KEY","CONFIG_SCHEMA","configState","configHydrated","humanSession","humanSessionSeed","human",
   src + "; return { H_tabs_create_mcp, H_set_tab_focus, H_get_config, H_set_config, effectiveConfig, writeConfig };");
-const H = mk(globalThis.chrome, tabGroupId, tabGroupTabs, isInGroup, ensureTabGroup, formatTabContext,
+const H = mk(globalThis.chrome, mcpGroups, isInGroup, formatTabContext,
   CONFIG_KEY, TAB_CONFIG_KEY, CONFIG_SCHEMA, configState, configHydrated, humanSession, humanSessionSeed, human);
 
 console.log("== #28: creating a tab must not select it or steal focus ==");
 api.length=0;
-await H.H_tabs_create_mcp.tabs_create_mcp({});
+await H.H_tabs_create_mcp.tabs_create_mcp({ groupName: "test" });
 const create = api.find(c=>c.name==="tabs.create");
 ok(create && create.arg.active===false, `tabs.create called with active:false (got ${JSON.stringify(create&&create.arg)})`);
 ok(create && create.arg.windowId===7, "new tab created in the MCP group's OWN window, not the operator's focused window");

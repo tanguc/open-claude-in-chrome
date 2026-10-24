@@ -96,13 +96,22 @@ EOF
 # that browser's NativeMessagingHosts directory.
 # ---------------------------------------------------------------------------
 create_unix_wrapper() {
-  NATIVE_HOST_PATH="$HOST_DIR/native-host-wrapper.sh"
+  local install_dir
+  if [ "$OS_KIND" = "mac" ]; then
+    install_dir="$HOME/Library/Application Support/open-claude-in-chrome"
+  else
+    install_dir="$HOME/.local/share/open-claude-in-chrome"
+  fi
+  # browsers cannot execute helpers on external volumes without a TCC grant
+  mkdir -p "$install_dir"
+  cp "$HOST_DIR/native-host.js" "$HOST_DIR/endpoint.js" "$HOST_DIR/package.json" "$install_dir/"
+  NATIVE_HOST_PATH="$install_dir/native-host-wrapper.sh"
   cat > "$NATIVE_HOST_PATH" << WRAPPER
 #!/bin/sh
-exec "$(command -v node)" "$HOST_DIR/native-host.js"
+exec "$(command -v node)" "$install_dir/native-host.js"
 WRAPPER
   chmod +x "$NATIVE_HOST_PATH"
-  echo "Created native host wrapper: $NATIVE_HOST_PATH"
+  echo "Installed native host and modules: $install_dir"
 }
 
 install_host() {

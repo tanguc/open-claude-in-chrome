@@ -13,20 +13,33 @@ export const TOOLS = [
   {
     name: "tabs_context_mcp",
     description:
-      "Get context information about the current MCP tab group. Returns all tab IDs inside the group if it exists. CRITICAL: You must get the context at least once before using other browser automation tools so you know what tabs exist. Each new conversation should create its own new tab (using tabs_create_mcp) rather than reusing existing tabs, unless the user explicitly asks to use an existing tab.",
+      "Inspect your named tab group. At session start, pass a unique groupName and createIfEmpty:true to establish one dedicated window per agent. Omit groupName to list all managed groups without creating one. Operate only on your own returned tab IDs.",
     paramShape: {
-      createIfEmpty: z
-        .boolean()
-        .optional()
-        .describe(
-          "Creates a new MCP tab group if none exists, creates a new Window with a new tab group containing an empty tab (which can be used for this conversation). If a MCP tab group already exists, this parameter has no effect."
-        )
+      groupName: z.string().min(1).max(50).optional().describe("Your agent's group name; required when creating a group."),
+      createIfEmpty: z.boolean().optional().describe("Create the named group in its own unfocused window if absent."),
+      color: z.enum(["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"]).optional()
     }
   },
   {
     name: "tabs_create_mcp",
     description:
-      "Creates a new empty tab in the MCP tab group. CRITICAL: You must get the context using tabs_context_mcp at least once before using other browser automation tools so you know what tabs exist.",
+      "Create an empty background tab in your named group's own window. Pass the groupName established with tabs_context_mcp. Does not select the tab or raise the window.",
+    paramShape: {
+      groupName: z.string().min(1).max(50).describe("Your agent's named group."),
+      color: z.enum(["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"]).optional()
+    }
+  },
+  {
+    name: "close_tabs",
+    description: "Close your workspace at session end. Provide exactly one of groupName (all tabs in that group) or tabIds. Every tab ID must be managed; the entire batch is validated before anything closes. An absent group is an idempotent no-op.",
+    paramShape: {
+      groupName: z.string().min(1).max(50).optional(),
+      tabIds: z.array(z.number().int()).min(1).optional()
+    }
+  },
+  {
+    name: "healthcheck",
+    description: "Diagnose the MCP runtime, local browser bridge and extension with a five-second probe. Returns transport, connection state, extension groups and advice. Call before falling back to another browser tool.",
     paramShape: {}
   },
   {
