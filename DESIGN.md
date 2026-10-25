@@ -8,7 +8,9 @@ MCP frontend -> tool-runtime.js -> local pipe -> native-host.js -> native messag
 
 The browser starts the native host through `connectNative`. The host owns the bridge and multiplexes connected MCP clients. A Claude Code session no longer binds a TCP port, classifies peers or elects a primary. Ending one session leaves the others connected.
 
-`host/endpoint.js` selects a Unix socket in a per-user 0700 directory on macOS/Linux, or a named pipe on Windows. `OCIC_PIPE` overrides the rendezvous for isolated tests; the `pipe` setting in the per-user config overrides the default for an installation. Both sides must resolve the same endpoint.
+`host/endpoint.js` selects `/tmp/open-claude-in-chrome-<uid>/bridge.sock` on macOS/Linux, or a named pipe on Windows. The POSIX path is independent of `TMPDIR`: browser launchers and MCP transports do not necessarily inherit the same environment. Its 0700 directory must be owned by the current user and must not be a symlink; unsafe collisions fail closed before permission changes. Socket permissions are 0600.
+
+`OCIC_PIPE` overrides the rendezvous for isolated tests; the `pipe` setting in the per-user config overrides the default for an installation. Explicit overrides do not create or modify the default directory. Both sides must resolve the same endpoint.
 
 The wire protocol is newline-delimited JSON between runtime and host. Browser native messaging uses a four-byte little-endian length prefix followed by JSON. The host namespaces request IDs per client and routes responses back to their origin. A dropped connection after dispatch leaves an unknown result: the runtime asks the caller to inspect page state instead of automatically replaying an action.
 

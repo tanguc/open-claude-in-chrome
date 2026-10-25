@@ -66,18 +66,22 @@ export function socketDir() {
   try {
     uid = os.userInfo().uid;
   } catch {}
+  // browser and MCP launchers may inherit different TMPDIR values
   return path.join(
-    os.tmpdir(),
+    "/tmp",
     `open-claude-in-chrome-${uid ?? currentUser().replace(/[^\w.-]/g, "_")}`
   );
 }
 
 export function ensureSocketDir() {
-  if (process.platform === "win32") return;
-  try {
-    fs.mkdirSync(socketDir(), { recursive: true, mode: 0o700 });
-    fs.chmodSync(socketDir(), 0o700);
-  } catch {}
+  if (process.platform === "win32" || process.env.OCIC_PIPE || configFile().pipe) return;
+  const dir = socketDir();
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const stat = fs.lstatSync(dir);
+  if (!stat.isDirectory() || stat.uid !== process.getuid()) {
+    throw new Error(`Unsafe browser bridge directory: ${dir}`);
+  }
+  fs.chmodSync(dir, 0o700);
 }
 
 // The 0700 directory is the real guard, but set the socket's own mode too, so

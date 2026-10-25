@@ -649,9 +649,10 @@ extension is not connected" above.
 ### Changing the rendezvous
 
 Sessions and the native host meet on a named pipe (`\\.\pipe\open-claude-in-chrome-<user>`
-on Windows, a unix socket under a 0700 directory on macOS and Linux). The name
-is derived from your username, so nothing needs configuring and two users on the
-same machine cannot collide.
+on Windows) or `/tmp/open-claude-in-chrome-<uid>/bridge.sock` on macOS and Linux.
+The POSIX directory is private (0700) and checked for ownership and symlinks;
+the socket is 0600. The default does not depend on `TMPDIR`, since MCP clients
+can filter that variable out even when the browser inherits it.
 
 To override it — normally only useful for running an isolated second instance:
 1. Create `~/.config/open-claude-in-chrome/config.json`:

@@ -91,6 +91,21 @@ check("posix: still fits when tmpdir is a long macOS-style path", () => {
   }
 });
 
+check("posix: browser and filtered MCP environments resolve the same address", () => {
+  const realTmp = os.tmpdir;
+  try {
+    for (const platform of ["linux", "darwin"]) {
+      os.tmpdir = () => "/var/folders/browser-environment/T";
+      const browser = asPlatform(platform, () => getPipePath());
+      os.tmpdir = () => "/tmp";
+      const client = asPlatform(platform, () => getPipePath());
+      assert(browser === client, `${platform}: browser ${browser} differs from client ${client}`);
+    }
+  } finally {
+    os.tmpdir = realTmp;
+  }
+});
+
 check("both platforms: a username with separators or spaces is sanitised", () => {
   const realUserInfo = os.userInfo;
   os.userInfo = () => ({ username: "DOMAIN\\Some User/x", uid: undefined });
