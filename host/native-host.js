@@ -155,6 +155,7 @@ async function claimPipe() {
   };
   pipeServer.once("error", onErr);
   pipeServer.listen(PIPE_PATH, () => {
+    secureSocket(PIPE_PATH);
     pipeServer.removeListener("error", onErr);
     process.stderr.write(`Native host owns the bridge at ${PIPE_PATH}\n`);
   });

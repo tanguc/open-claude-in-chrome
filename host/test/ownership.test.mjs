@@ -14,6 +14,7 @@
 // Run: node host/test/ownership.test.mjs
 
 import net from "node:net";
+import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -199,13 +200,19 @@ console.log("\nBrowser-bridge ownership\n");
 
 await test("host claims a free bridge and reports itself as owner", async (pipe) => {
   const ext = fakeExtension();
-  await waitFor(
-    async () => /owns the bridge at/.test(ext.stderrText()),
-    5000,
-    "host announces ownership"
-  );
-  assert(await bridgeIsHeld(pipe), "bridge should be served by the host");
-  ext.kill();
+  try {
+    await waitFor(
+      async () => /owns the bridge at/.test(ext.stderrText()),
+      5000,
+      "host announces ownership"
+    );
+    assert(await bridgeIsHeld(pipe), "bridge should be served by the host");
+    if (process.platform !== "win32") {
+      assert((fs.statSync(pipe).mode & 0o777) === 0o600, "live socket should have mode 0600");
+    }
+  } finally {
+    ext.kill();
+  }
 });
 
 await test("a client's request reaches the extension and the reply comes back", async (pipe) => {
