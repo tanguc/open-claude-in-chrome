@@ -10,7 +10,7 @@
   <br/>
   <sub>Clean-room reimplementation of Anthropic's browser extension. No blocklist. Any Chromium browser. 100% feature &amp; performance parity.</sub>
   <br/>
-  <sub>by <a href="https://noemica.io">noemica</a></sub>
+  <sub>Fork of <a href="https://github.com/noemica-io/open-claude-in-chrome">noemica-io/open-claude-in-chrome</a> by <a href="https://noemica.io">noemica</a>, published by its author as MIT (see <a href="#provenance-and-license">provenance</a>)</sub>
 </p>
 
 <p align="center">
@@ -18,6 +18,7 @@
   <a href="#installation">Install</a> ·
   <a href="#imitation-learning-recording">Imitation learning</a> ·
   <a href="#architecture">Architecture</a> ·
+  <a href="#provenance-and-license">Provenance</a> ·
   <a href="https://youtu.be/n4-2fjOsGhw">Demo</a> ·
   <a href="https://www.noemica.io/blog/reverse-engineered-claude-in-chrome">How I built it</a>
 </p>
@@ -36,13 +37,15 @@
 
 The official [Claude in Chrome](https://code.claude.com/docs/en/chrome) extension gives Claude Code full browser automation — as long as you stay within Anthropic's allowlist of "safe" sites. Open Claude in Chrome is a clean-room reimplementation that strips the restrictions while keeping all 21 MCP tools and matching the official extension's performance.
 
+This repository is a fork. The upstream author announced the project as "open source and MIT licensed", which is what allows us to fork it, change it and redistribute it. The [provenance section](#provenance-and-license) records where that statement comes from and which upstream commits it covers.
+
 ## What's Different
 
 | | Claude in Chrome | Open Claude in Chrome |
 |---|---|---|
 | **Domain blocklist** | 58 blocked domains across 11 categories | No blocklist. Navigate anywhere. |
 | **Browser support** | Chrome and Edge only | Any Chromium browser (Chrome, Edge, Brave, Arc, Opera, Vivaldi, etc.) |
-| **Source code** | Closed source | Source-available, [PolyForm Noncommercial](LICENSE) |
+| **Source code** | Closed source | Forked from MIT-licensed upstream; later upstream commits are [PolyForm Noncommercial](LICENSE) ([details](#provenance-and-license)) |
 | **Tools** | 21 MCP tools | Browser tools plus named groups, diagnostics and recording |
 | **Performance** | Baseline | Identical |
 
@@ -664,8 +667,50 @@ To override it — normally only useful for running an isolated second instance:
 `OCIC_PIPE` does the same thing per-process, which is how the test suite stands
 up a whole host + client fleet without touching a live install.
 
-## License
+## Provenance and license
 
-The current upstream code is provided under [PolyForm Noncommercial 1.0.0](LICENSE). These terms permit noncommercial use; commercial use requires a separate license. Third-party components retain their own license notices.
+This fork comes from [noemica-io/open-claude-in-chrome](https://github.com/noemica-io/open-claude-in-chrome), written by [Sebastian Sosa](https://github.com/CakeCrusher) ([Noemica](https://noemica.io)).
 
-Built by [Sebastian Sosa](https://github.com/CakeCrusher) ([Noemica](https://noemica.io))
+The author's blog post at [noemica.io/blog/reverse-engineered-claude-in-chrome](https://www.noemica.io/blog/reverse-engineered-claude-in-chrome) says, in its "The repo" section (screenshot taken 2026-11-21 at 16:11):
+
+> It's open source and MIT licensed: [Open Claude in Chrome](https://github.com/noemica-io/open-claude-in-chrome)
+>
+> 6 files. ~2,200 lines. Works in any Chromium browser (Chrome, Brave, Edge, Arc, Opera, Vivaldi). No domain blocklist. All 18 MCP tools. [...]
+
+The upstream README said the same thing (`## License` / `MIT`) from 2026-04-03 until 2026-07-22. The MIT license lets anyone use, copy, modify, merge, publish, distribute, sublicense and sell the software, as long as the copyright and permission notice stay with it. A license already granted on published code can't be withdrawn, so everything upstream released under MIT stays MIT here, and we're free to fork it and do what we want with it under those terms.
+
+The license did change upstream later, and the history matters:
+
+| Upstream code | License |
+|---|---|
+| Original history, [`5171297`](https://github.com/noemica-io/open-claude-in-chrome/commit/5171297) to [`6a35913`](https://github.com/noemica-io/open-claude-in-chrome/commit/6a35913e15cff68ab02fd3d4576538c56fc55802) (2026-03-31 to 2026-04-06) | MIT |
+| Rewritten history up to [`aa9c880`](https://github.com/noemica-io/open-claude-in-chrome/commit/aa9c8802d74ba2614e6a96cfdd62a4283741ba2c) (2026-07-22) | MIT, still stated in the README |
+| From [`23bef41`](https://github.com/noemica-io/open-claude-in-chrome/commit/23bef41bfb1e3cb54e80f22be2ab36657581ee97) (2026-07-22), which adds the [LICENSE](LICENSE) file | [PolyForm Noncommercial 1.0.0](LICENSE) |
+
+This fork has merged upstream commits up to [`6a37c29`](https://github.com/noemica-io/open-claude-in-chrome/commit/6a37c291f92c038f85807b77afe6ab1205d7752c) (2026-09-22), so part of the current tree comes from the PolyForm period. Those parts keep their PolyForm Noncommercial terms: noncommercial use is fine, commercial use needs a separate license from the author. The MIT freedom applies in full to the MIT-era code and to the changes made in this fork. Third-party components keep their own license notices.
+
+Upstream only wrote `MIT` and never shipped a license file during that period, so the notice below is the standard MIT text with the author named the way the upstream README credited them:
+
+```
+MIT License
+
+Copyright (c) 2026 Sebastian Sosa (Noemica)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
