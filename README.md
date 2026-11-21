@@ -671,7 +671,7 @@ up a whole host + client fleet without touching a live install.
 
 This fork comes from [noemica-io/open-claude-in-chrome](https://github.com/noemica-io/open-claude-in-chrome), written by [Sebastian Sosa](https://github.com/CakeCrusher) ([Noemica](https://noemica.io)).
 
-The author's blog post at [noemica.io/blog/reverse-engineered-claude-in-chrome](https://www.noemica.io/blog/reverse-engineered-claude-in-chrome) says, in its "The repo" section (screenshot taken 2026-11-21 at 16:11):
+The author's blog post at [noemica.io/blog/reverse-engineered-claude-in-chrome](https://www.noemica.io/blog/reverse-engineered-claude-in-chrome) says, in its "The repo" section (screenshot taken [2026-11-21 at 16:11](https://web.archive.org/web/20261121151458/https://www.noemica.io/blog/reverse-engineered-claude-in-chrome)):
 
 > It's open source and MIT licensed: [Open Claude in Chrome](https://github.com/noemica-io/open-claude-in-chrome)
 >
